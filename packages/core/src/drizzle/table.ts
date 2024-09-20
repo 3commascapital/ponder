@@ -8,7 +8,7 @@ import type {
   ScalarColumn,
 } from "@/schema/common.js";
 import type { InferColumnType } from "@/schema/infer.js";
-import type { BuildColumns, ColumnBuilderBase } from "drizzle-orm";
+import type { BuildColumns, ColumnBuilderBase, GeneratedColumnConfig } from "drizzle-orm";
 import type { TableWithColumns } from "./select.js";
 
 /**
@@ -33,6 +33,7 @@ export type DrizzleTable<
         data: InferColumnType<table[columnName], schema>;
         driverParam: unknown;
         enumValues: undefined;
+        generated: GeneratedColumnConfig<unknown> | undefined;
         notNull: (table[columnName] &
           (
             | ScalarColumn

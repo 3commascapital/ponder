@@ -61,7 +61,7 @@ export class MetricsService {
   ponder_postgres_query_queue_size: prometheus.Gauge<"pool"> = null!;
   ponder_postgres_query_total: prometheus.Counter<"pool"> = null!;
 
-  ponder_sqlite_query_total: prometheus.Counter<"database"> = null!;
+  ponder_pglite_query_total: prometheus.Counter<"database"> = null!;
 
   constructor() {
     this.registry = new prometheus.Registry();
@@ -281,10 +281,11 @@ export async function getSyncProgress(metrics: MetricsService): Promise<
   const rpcRequestMetrics = await metrics.ponder_rpc_request_duration.get();
   for (const m of rpcRequestMetrics.values) {
     if (m.metricName === "ponder_rpc_request_duration_count") {
-      if (requestCount[m.labels.network!] === undefined) {
-        requestCount[m.labels.network!] = 0;
+      let value = requestCount[m.labels.network!]
+      if (value === undefined) {
+        value = 0;
       }
-      requestCount[m.labels.network!] += m.value;
+      requestCount[m.labels.network!] = value + m.value;
     }
   }
 

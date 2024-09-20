@@ -71,7 +71,7 @@ export function setupCommon(context: TestContext) {
  *
  * If `process.env.DATABASE_URL` is set, creates a new database and drops
  * it in the cleanup function. If it's not set, creates a temporary directory
- * for SQLite and removes it in the cleanup function.
+ * for PGLite and removes it in the cleanup function.
  *
  * ```ts
  * // Add this to any test suite that uses the database.
@@ -105,7 +105,7 @@ export async function setupIsolatedDatabase(context: TestContext) {
     const tempDir = path.join(os.tmpdir(), randomUUID());
     mkdirSync(tempDir, { recursive: true });
 
-    context.databaseConfig = { kind: "sqlite", directory: tempDir };
+    context.databaseConfig = { kind: "pglite", directory: tempDir };
 
     return () => {
       rimrafSync(tempDir);

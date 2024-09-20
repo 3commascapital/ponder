@@ -269,7 +269,7 @@ test("setup succeeds if the lock expires after waiting to expire", async (contex
 
   // Update the prior app lock row to simulate an abrupt shutdown.
   const row = await databaseTwo.qb.internal
-    .selectFrom("_ponder_meta")
+    .select("_ponder_meta")
     .where("key", "=", "app")
     .select("value")
     .executeTakeFirst();
@@ -279,7 +279,7 @@ test("setup succeeds if the lock expires after waiting to expire", async (contex
     .where("key", "=", "app")
     .set({
       value:
-        database.dialect === "sqlite"
+        database.dialect === "pglite"
           ? JSON.stringify({
               ...JSON.parse(row!.value!),
               is_locked: true,
@@ -378,13 +378,13 @@ test("heartbeat updates the heartbeat_at value", async (context) => {
 
   expect(
     BigInt(
-      database.dialect === "sqlite"
+      database.dialect === "pglite"
         ? JSON.parse(rowAfterHeartbeat!.value!).heartbeat_at
         : // @ts-ignore
           rowAfterHeartbeat!.value!.heartbeat_at,
     ),
   ).toBeGreaterThan(
-    database.dialect === "sqlite"
+    database.dialect === "pglite"
       ? JSON.parse(row!.value!).heartbeat_at
       : // @ts-ignore
         row!.value!.heartbeat_at,
@@ -415,7 +415,7 @@ test("finalize updates lock table", async (context) => {
     .executeTakeFirst();
 
   expect(
-    database.dialect === "sqlite"
+    database.dialect === "pglite"
       ? JSON.parse(row!.value!).checkpoint
       : // @ts-ignore
         row!.value!.checkpoint,
@@ -523,13 +523,13 @@ test("kill releases the namespace lock", async (context) => {
     .executeTakeFirst();
 
   expect(
-    database.dialect === "sqlite"
+    database.dialect === "pglite"
       ? JSON.parse(row!.value!).is_locked
       : // @ts-ignore
         row!.value!.is_locked,
   ).toBe(1);
   expect(
-    database.dialect === "sqlite"
+    database.dialect === "pglite"
       ? JSON.parse(rowAfterKill!.value!).is_locked
       : // @ts-ignore
         rowAfterKill!.value!.is_locked,
@@ -634,7 +634,7 @@ test("setup with the same build ID drops indexes", async (context) => {
   const indexes = await getUserIndexNames(databaseTwo, "Person");
 
   expect(indexes).toStrictEqual([
-    database.dialect === "sqlite" ? "sqlite_autoindex_Person_1" : "Person_pkey",
+    database.dialect === "pglite" ? "pglite_autoindex_Person_1" : "Person_pkey",
   ]);
 
   await databaseTwo.kill();
@@ -761,8 +761,8 @@ test("revert() updates versions with intermediate logs", async (context) => {
 
 async function getUserTableNames(database: Database) {
   const { rows } = await database.qb.internal.executeQuery<{ name: string }>(
-    database.dialect === "sqlite"
-      ? sql`SELECT name FROM sqlite_master WHERE type='table'`.compile(
+    database.dialect === "pglite"
+      ? sql`SELECT name FROM pglite_master WHERE type='table'`.compile(
           database.qb.internal,
         )
       : sql`
@@ -780,8 +780,8 @@ async function getUserIndexNames(database: Database, tableName: string) {
     name: string;
     tbl_name: string;
   }>(
-    database.dialect === "sqlite"
-      ? sql`SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='${sql.raw(tableName)}'`.compile(
+    database.dialect === "pglite"
+      ? sql`SELECT name FROM pglite_master WHERE type='index' AND tbl_name='${sql.raw(tableName)}'`.compile(
           database.qb.internal,
         )
       : sql`

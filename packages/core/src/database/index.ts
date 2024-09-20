@@ -29,10 +29,10 @@ import {
 import { formatEta } from "@/utils/format.js";
 import { createPool, createReadonlyPool } from "@/utils/pg.js";
 import {
-  type SqliteDatabase,
-  createReadonlySqliteDatabase,
+  type PgliteDatabase,
+  createReadonlyPgliteDatabase,
   createSqliteDatabase,
-} from "@/utils/sqlite.js";
+} from "@/utils/pglite.js";
 import { wait } from "@/utils/wait.js";
 import {
   Migrator,
@@ -41,13 +41,12 @@ import {
   WithSchemaPlugin,
   sql,
 } from "kysely";
-import { SqliteDialect } from "kysely";
 import type { Pool } from "pg";
 import prometheus from "prom-client";
 import { HeadlessKysely } from "./kysely.js";
 
 export type Database<
-  dialect extends "sqlite" | "postgres" = "sqlite" | "postgres",
+  dialect extends "pglite" | "postgres" = "pglite" | "postgres",
 > = {
   dialect: dialect;
   namespace: string;
@@ -101,11 +100,11 @@ type PonderInternalSchema = {
   [tableName: string]: UserTable;
 };
 
-type Driver<dialect extends "sqlite" | "postgres"> = dialect extends "sqlite"
+type Driver<dialect extends "pglite" | "postgres"> = dialect extends "pglite"
   ? {
-      user: SqliteDatabase;
-      readonly: SqliteDatabase;
-      sync: SqliteDatabase;
+      user: PgliteDatabase;
+      readonly: PgliteDatabase;
+      sync: PgliteDatabase;
     }
   : {
       internal: Pool;
@@ -159,8 +158,8 @@ export const createDatabase = (args: {
   let driver: Database["driver"];
   let qb: Database["qb"];
 
-  if (args.databaseConfig.kind === "sqlite") {
-    dialect = "sqlite";
+  if (args.databaseConfig.kind === "pglite") {
+    dialect = "pglite";
     namespace = "public";
 
     const userFile = path.join(args.databaseConfig.directory, "public.db");
@@ -168,7 +167,7 @@ export const createDatabase = (args: {
 
     driver = {
       user: createSqliteDatabase(userFile),
-      readonly: createReadonlySqliteDatabase(userFile),
+      readonly: createReadonlyPgliteDatabase(userFile),
       sync: createSqliteDatabase(syncFile),
     };
 
@@ -176,10 +175,10 @@ export const createDatabase = (args: {
       internal: new HeadlessKysely({
         name: "internal",
         common: args.common,
-        dialect: new SqliteDialect({ database: driver.user }),
+        dialect: new PostgresDialect({ pool: driver.user }),
         log(event) {
           if (event.level === "query") {
-            args.common.metrics.ponder_sqlite_query_total.inc({
+            args.common.metrics.ponder_pglite_query_total.inc({
               database: "internal",
             });
           }
@@ -188,10 +187,10 @@ export const createDatabase = (args: {
       user: new HeadlessKysely({
         name: "user",
         common: args.common,
-        dialect: new SqliteDialect({ database: driver.user }),
+        dialect: new PostgresDialect({ pool: driver.user }),
         log(event) {
           if (event.level === "query") {
-            args.common.metrics.ponder_sqlite_query_total.inc({
+            args.common.metrics.ponder_pglite_query_total.inc({
               database: "user",
             });
           }
@@ -200,10 +199,10 @@ export const createDatabase = (args: {
       readonly: new HeadlessKysely({
         name: "readonly",
         common: args.common,
-        dialect: new SqliteDialect({ database: driver.readonly }),
+        dialect: new PostgresDialect({ database: driver.readonly }),
         log(event) {
           if (event.level === "query") {
-            args.common.metrics.ponder_sqlite_query_total.inc({
+            args.common.metrics.ponder_pglite_query_total.inc({
               database: "readonly",
             });
           }
@@ -212,10 +211,10 @@ export const createDatabase = (args: {
       sync: new HeadlessKysely<PonderSyncSchema>({
         name: "sync",
         common: args.common,
-        dialect: new SqliteDialect({ database: driver.sync }),
+        dialect: new PostgresDialect({ database: driver.sync }),
         log(event) {
           if (event.level === "query") {
-            args.common.metrics.ponder_sqlite_query_total.inc({
+            args.common.metrics.ponder_pglite_query_total.inc({
               database: "sync",
             });
           }
@@ -318,10 +317,10 @@ export const createDatabase = (args: {
   // Register metrics
   if (dialect === "sqlite") {
     args.common.metrics.registry.removeSingleMetric(
-      "ponder_sqlite_query_total",
+      "ponder_pglite_query_total",
     );
-    args.common.metrics.ponder_sqlite_query_total = new prometheus.Counter({
-      name: "ponder_sqlite_query_total",
+    args.common.metrics.ponder_pglite_query_total = new prometheus.Counter({
+      name: "ponder_pglite_query_total",
       help: "Number of queries submitted to the database",
       labelNames: ["database"] as const,
       registers: [args.common.metrics.registry],
@@ -534,7 +533,7 @@ export const createDatabase = (args: {
           const _orm = new HeadlessKysely<any>({
             name: "user",
             common: args.common,
-            dialect: new SqliteDialect({ database: _driver }),
+            dialect: new PostgresDialect({ database: _driver }),
           });
           await qb.internal.wrap({ method: "setup" }, async () => {
             const namespaceCount = await _orm

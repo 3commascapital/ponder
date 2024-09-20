@@ -52,5 +52,8 @@
   },
   "imports": {
     "@ponder/common": "../common/index.ts"
+  },
+  "dependencies": {
+    "kysely": "^0.27.4"
   }
 }
