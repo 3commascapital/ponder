@@ -1,6 +1,12 @@
 import type { Common } from "@/common/common.js";
+import { getAppProgress } from "@/common/metrics.js";
 import type { Network } from "@/config/networks.js";
 import {
+  type HistoricalSync,
+  createHistoricalSync,
+} from "@/sync-historical/index.js";
+import {
+  type BlockWithEventData,
   type RealtimeSync,
   type RealtimeSyncEvent,
   createRealtimeSync,
@@ -9,30 +15,42 @@ import type { SyncStore } from "@/sync-store/index.js";
 import type { LightBlock, SyncBlock } from "@/types/sync.js";
 import {
   type Checkpoint,
-  checkpointMin,
   decodeCheckpoint,
   encodeCheckpoint,
   maxCheckpoint,
   zeroCheckpoint,
 } from "@/utils/checkpoint.js";
 import { estimate } from "@/utils/estimate.js";
-import type { Interval } from "@/utils/interval.js";
+import { formatEta, formatPercentage } from "@/utils/format.js";
+import { mergeAsyncGenerators } from "@/utils/generators.js";
+import {
+  type Interval,
+  intervalDifference,
+  intervalIntersection,
+  intervalSum,
+  sortIntervals,
+} from "@/utils/interval.js";
+import { intervalUnion } from "@/utils/interval.js";
 import { never } from "@/utils/never.js";
-import { createQueue } from "@ponder/common";
-import { type Transport, hexToBigInt, hexToNumber } from "viem";
+import { type RequestQueue, createRequestQueue } from "@/utils/requestQueue.js";
+import { startClock } from "@/utils/timer.js";
+import {
+  type Address,
+  type Hash,
+  type Transport,
+  hexToBigInt,
+  hexToNumber,
+} from "viem";
 import { _eth_getBlockByNumber } from "../utils/rpc.js";
-import type { RawEvent } from "./events.js";
-import { type LocalSync, createLocalSync } from "./local.js";
-import type { Source } from "./source.js";
+import { type RawEvent, buildEvents } from "./events.js";
+import { type Factory, type Source, isAddressFactory } from "./source.js";
 import { cachedTransport } from "./transport.js";
 
 export type Sync = {
   getEvents(): AsyncGenerator<{ events: RawEvent[]; checkpoint: string }>;
-  startRealtime(): void;
+  startRealtime(): Promise<void>;
   getStatus(): Status;
-  /** Return the minimum start checkpoint (supremum) for all networks. */
   getStartCheckpoint(): string;
-  /** Return the minimum finalized checkpoint (supremum) for all networks. */
   getFinalizedCheckpoint(): string;
   getCachedTransport(network: Network): Transport;
   kill(): Promise<void>;
@@ -42,6 +60,7 @@ export type RealtimeEvent =
   | {
       type: "block";
       checkpoint: string;
+      status: Status;
       events: RawEvent[];
     }
   | {
@@ -60,197 +79,331 @@ export type Status = {
   };
 };
 
+export type SyncProgress = {
+  start: SyncBlock | LightBlock;
+  end: SyncBlock | LightBlock | undefined;
+  cached: SyncBlock | LightBlock | undefined;
+  current: SyncBlock | LightBlock | undefined;
+  finalized: SyncBlock | LightBlock;
+};
+
 export const syncBlockToLightBlock = ({
   hash,
   parentHash,
   number,
   timestamp,
-}: SyncBlock): LightBlock => ({ hash, parentHash, number, timestamp });
+}: SyncBlock): LightBlock => ({
+  hash,
+  parentHash,
+  number,
+  timestamp,
+});
+
+/** Convert `block` to a `Checkpoint`. */
+export const blockToCheckpoint = (
+  block: LightBlock | SyncBlock,
+  chainId: number,
+  rounding: "up" | "down",
+): Checkpoint => {
+  return {
+    ...(rounding === "up" ? maxCheckpoint : zeroCheckpoint),
+    blockTimestamp: hexToNumber(block.timestamp),
+    chainId: BigInt(chainId),
+    blockNumber: hexToBigInt(block.number),
+  };
+};
+
+/**
+ * Returns true if all filters have a defined end block and the current
+ * sync progress has reached the final end block.
+ */
+const isSyncEnd = (syncProgress: SyncProgress) => {
+  if (syncProgress.end === undefined || syncProgress.current === undefined) {
+    return false;
+  }
+
+  return (
+    hexToNumber(syncProgress.current.number) >=
+    hexToNumber(syncProgress.end.number)
+  );
+};
+
+/** Returns true if sync progress has reached the finalized block. */
+const isSyncFinalized = (syncProgress: SyncProgress) => {
+  if (syncProgress.current === undefined) {
+    return false;
+  }
+
+  return (
+    hexToNumber(syncProgress.current.number) >=
+    hexToNumber(syncProgress.finalized.number)
+  );
+};
+
+/** Returns the closest-to-tip block that is part of the historical sync. */
+const getHistoricalLast = (
+  syncProgress: Pick<SyncProgress, "finalized" | "end">,
+) => {
+  return syncProgress.end === undefined
+    ? syncProgress.finalized
+    : hexToNumber(syncProgress.end.number) >
+        hexToNumber(syncProgress.finalized.number)
+      ? syncProgress.finalized
+      : syncProgress.end;
+};
+
+/** Compute the minimum checkpoint, filtering out undefined */
+const min = (...checkpoints: (string | undefined)[]) => {
+  return checkpoints.reduce((acc, cur) => {
+    if (cur === undefined) return acc;
+    if (acc === undefined) return cur;
+    if (acc < cur) return acc;
+    return cur;
+  })!;
+};
+
+export const splitEvents = (events: RawEvent[]): RawEvent[][] => {
+  let prevHash: Hash | undefined;
+  const result: RawEvent[][] = [];
+
+  for (const event of events) {
+    if (prevHash === undefined || prevHash !== event.block.hash) {
+      result.push([]);
+      prevHash = event.block.hash;
+    }
+
+    result[result.length - 1]!.push(event);
+  }
+
+  return result;
+};
+
+/** Returns the checkpoint for a given block tag. */
+export const getChainCheckpoint = ({
+  syncProgress,
+  network,
+  tag,
+}: {
+  syncProgress: SyncProgress;
+  network: Network;
+  tag: "start" | "current" | "finalized" | "end";
+}): string | undefined => {
+  if (tag === "end" && syncProgress.end === undefined) {
+    return undefined;
+  }
+
+  if (tag === "current" && isSyncEnd(syncProgress)) {
+    return undefined;
+  }
+
+  const block = syncProgress[tag]!;
+  return encodeCheckpoint(
+    blockToCheckpoint(
+      block,
+      network.chainId,
+      // The checkpoint returned by this function is meant to be used in
+      // a closed interval (includes endpoints), so "start" should be inclusive.
+      tag === "start" ? "down" : "up",
+    ),
+  );
+};
 
 type CreateSyncParameters = {
   common: Common;
   syncStore: SyncStore;
   sources: Source[];
   networks: Network[];
-  onRealtimeEvent(event: RealtimeEvent): void;
+  onRealtimeEvent(event: RealtimeEvent): Promise<void>;
   onFatalError(error: Error): void;
-  initialCheckpoint: Checkpoint;
+  initialCheckpoint: string;
 };
 
 export const createSync = async (args: CreateSyncParameters): Promise<Sync> => {
-  // Network-specific syncs and status
-  const localSyncs = new Map<Network, LocalSync>();
-  const realtimeSyncs = new Map<Network, RealtimeSync>();
+  const localSyncContext = new Map<
+    Network,
+    {
+      requestQueue: RequestQueue;
+      syncProgress: SyncProgress;
+      historicalSync: HistoricalSync;
+      realtimeSync: RealtimeSync;
+      unfinalizedEventData: BlockWithEventData[];
+    }
+  >();
   const status: Status = {};
   let isKilled = false;
+  // Realtime events across all chains that can't be passed to the parent function
+  // because the overall checkpoint hasn't caught up to the events yet.
+  let pendingEvents: RawEvent[] = [];
 
-  // Create a `LocalSync` for each network, populating `localSyncs`.
+  // Instantiate `localSyncData` and `status`
   await Promise.all(
     args.networks.map(async (network) => {
-      const localSync = await createLocalSync({
+      const requestQueue = createRequestQueue({
+        network,
         common: args.common,
-        syncStore: args.syncStore,
-        sources: args.sources.filter(
-          ({ filter }) => filter.chainId === network.chainId,
-        ),
+      });
+      const sources = args.sources.filter(
+        ({ filter }) => filter.chainId === network.chainId,
+      );
+
+      const { start, end, finalized } = await syncDiagnostic({
+        common: args.common,
+        sources,
+        requestQueue,
         network,
       });
-      localSyncs.set(network, localSync);
+
+      // Invalidate sync cache for devnet sources
+      if (network.disableCache) {
+        args.common.logger.warn({
+          service: "sync",
+          msg: `Deleting cache records for '${network.name}' from block ${hexToNumber(start.number)}`,
+        });
+
+        await args.syncStore.pruneByChain({
+          fromBlock: hexToNumber(start.number),
+          chainId: network.chainId,
+        });
+      }
+
+      const historicalSync = await createHistoricalSync({
+        common: args.common,
+        sources,
+        syncStore: args.syncStore,
+        requestQueue,
+        network,
+        onFatalError: args.onFatalError,
+      });
+      const realtimeSync = createRealtimeSync({
+        common: args.common,
+        sources,
+        requestQueue,
+        network,
+        onEvent: (event) =>
+          onRealtimeSyncEvent({ event, network }).catch((error) => {
+            args.common.logger.error({
+              service: "sync",
+              msg: `Fatal error: Unable to process ${event.type} event`,
+              error,
+            });
+            args.onFatalError(error);
+          }),
+        onFatalError: args.onFatalError,
+      });
+
+      const cached = await getCachedBlock({
+        sources,
+        requestQueue,
+        historicalSync,
+      });
+
+      // Update "ponder_sync_block" metric
+      if (cached !== undefined) {
+        args.common.metrics.ponder_sync_block.set(
+          { network: network.name },
+          hexToNumber(cached.number),
+        );
+      }
+
+      const syncProgress: SyncProgress = {
+        start,
+        end,
+        finalized,
+        cached,
+        current: cached,
+      };
+
+      args.common.metrics.ponder_sync_is_realtime.set(
+        { network: network.name },
+        0,
+      );
+      args.common.metrics.ponder_sync_is_complete.set(
+        { network: network.name },
+        0,
+      );
+
+      localSyncContext.set(network, {
+        requestQueue,
+        syncProgress,
+        historicalSync,
+        realtimeSync,
+        unfinalizedEventData: [],
+      });
       status[network.name] = { block: null, ready: false };
     }),
   );
 
-  // Invalidate sync cache for devnet sources
-  for (const network of args.networks) {
-    if (network.disableCache) {
-      const startBlock = hexToNumber(
-        localSyncs.get(network)!.startBlock.number,
-      );
-
-      args.common.logger.warn({
-        service: "sync",
-        msg: `Deleting cache records for '${network.name}' from block ${startBlock}`,
-      });
-
-      await args.syncStore.pruneByChain({
-        fromBlock: startBlock,
-        chainId: network.chainId,
-      });
-    }
-  }
-
-  /** Convert `block` to a `Checkpoint`. */
-  const blockToCheckpoint = (
-    block: LightBlock | SyncBlock,
-    chainId: number,
-    rounding: "up" | "down",
-  ): Checkpoint => {
-    return {
-      ...(rounding === "up" ? maxCheckpoint : zeroCheckpoint),
-      blockTimestamp: hexToNumber(block.timestamp),
-      chainId: BigInt(chainId),
-      blockNumber: hexToBigInt(block.number),
-    };
-  };
-
   /**
    * Returns the minimum checkpoint across all chains.
-   *
-   * Note: `localSync.latestBlock` is assumed to be defined if
-   * this function is called with `tag`: "latest".
    */
-  const getChainsCheckpoint = (
-    tag: "start" | "latest" | "finalized" | "end",
+  const getOmnichainCheckpoint = (
+    tag: "start" | "end" | "current" | "finalized",
   ): string | undefined => {
-    if (
-      tag === "end" &&
-      [...localSyncs.values()].some(
-        (localSync) => localSync.endBlock === undefined,
-      )
-    ) {
+    const checkpoints = Array.from(localSyncContext.entries()).map(
+      ([network, { syncProgress }]) =>
+        getChainCheckpoint({ syncProgress, network, tag }),
+    );
+
+    if (tag === "end" && checkpoints.some((c) => c === undefined)) {
       return undefined;
     }
 
-    let checkpoints = [...localSyncs.entries()];
-    if (tag === "latest") {
-      checkpoints = checkpoints.filter(
-        ([, localSync]) => localSync.isComplete() === false,
-      );
-      // Return early if all networks are complete
-      if (checkpoints.length === 0) return undefined;
+    if (tag === "current" && checkpoints.every((c) => c === undefined)) {
+      return undefined;
     }
 
-    return encodeCheckpoint(
-      checkpointMin(
-        ...checkpoints.map(([network, localSync]) => {
-          const block = localSync[`${tag}Block`]!;
-
-          // The checkpoint returned by this function is meant to be used in
-          // a closed interval (includes endpoints), so "start" should be inclusive.
-          return blockToCheckpoint(
-            block,
-            network.chainId,
-            tag === "start" ? "down" : "up",
-          );
-        }),
-      ),
-    );
+    return min(...checkpoints);
   };
 
-  /** Updates `status` to record progress for each network. */
-  const updateStatus = (
-    events: RawEvent[],
-    checkpoint: string,
-    isRealtime: boolean,
-  ) => {
-    /**
-     * If `realtimeSync` is defined for a network, use `localChain`
-     * to find the most recently processed block for each network, and return.
-     */
-    if (isRealtime) {
-      for (const [network, realtimeSync] of realtimeSyncs) {
-        const localBlock = realtimeSync.localChain.findLast(
-          (block) =>
-            encodeCheckpoint(blockToCheckpoint(block, network.chainId, "up")) <=
-            checkpoint,
-        );
-        if (localBlock !== undefined) {
+  const updateHistoricalStatus = ({
+    events,
+    checkpoint,
+    network,
+  }: { events: RawEvent[]; checkpoint: string; network: Network }) => {
+    if (Number(decodeCheckpoint(checkpoint).chainId) === network.chainId) {
+      status[network.name]!.block = {
+        timestamp: decodeCheckpoint(checkpoint).blockTimestamp,
+        number: Number(decodeCheckpoint(checkpoint).blockNumber),
+      };
+    } else {
+      let i = events.length - 1;
+      while (i >= 0) {
+        const event = events[i]!;
+
+        if (network.chainId === event.chainId) {
           status[network.name]!.block = {
-            timestamp: hexToNumber(localBlock.timestamp),
-            number: hexToNumber(localBlock.number),
+            timestamp: decodeCheckpoint(event.checkpoint).blockTimestamp,
+            number: Number(decodeCheckpoint(event.checkpoint).blockNumber),
           };
         }
-      }
 
-      return;
-    }
-
-    /**
-     * Otherwise, reverse iterate through `events` updating `status` for each network.
-     */
-
-    const staleNetworks = new Map<number, Network>();
-    for (const [network] of localSyncs) {
-      staleNetworks.set(network.chainId, network);
-    }
-
-    let i = events.length - 1;
-    while (i >= 0 && staleNetworks.size > 0) {
-      const event = events[i]!;
-
-      if (staleNetworks.has(event.chainId)) {
-        const network = staleNetworks.get(event.chainId)!;
-        const { blockTimestamp, blockNumber } = decodeCheckpoint(
-          event.checkpoint,
-        );
-
-        status[network.name]!.block = {
-          timestamp: blockTimestamp,
-          number: Number(blockNumber),
-        };
-
-        staleNetworks.delete(event.chainId);
-      }
-
-      i--;
-    }
-
-    /**
-     * Additionally, use `latestBlock` to provide a more accurate `status
-     * if it is available.
-     */
-    for (const [network, localSync] of localSyncs) {
-      const latestBlock = localSync.latestBlock;
-      if (latestBlock !== undefined) {
-        status[network.name]!.block = {
-          timestamp: hexToNumber(latestBlock.timestamp),
-          number: hexToNumber(latestBlock.number),
-        };
+        i--;
       }
     }
   };
 
-  let latestFinalizedFetch = Date.now() / 1_000;
+  const updateRealtimeStatus = ({
+    checkpoint,
+    network,
+  }: {
+    checkpoint: string;
+    network: Network;
+  }) => {
+    const localBlock = localSyncContext
+      .get(network)!
+      .realtimeSync.unfinalizedBlocks.findLast(
+        (block) =>
+          encodeCheckpoint(blockToCheckpoint(block, network.chainId, "up")) <=
+          checkpoint,
+      );
+    if (localBlock !== undefined) {
+      status[network.name]!.block = {
+        timestamp: hexToNumber(localBlock.timestamp),
+        number: hexToNumber(localBlock.number),
+      };
+    }
+  };
+
   /**
    * Estimate optimal range (seconds) to query at a time, eventually
    * used to determine `to` passed to `getEvents`
@@ -267,131 +420,184 @@ export const createSync = async (args: CreateSyncParameters): Promise<Sync> => {
    * networks. This approach is not future proof.
    */
   async function* getEvents() {
+    let latestFinalizedFetch = Date.now();
+
     /**
-     * Calculate start checkpoint, if `args.initial` is non-zero,
-     * use that. Otherwise, use `start`
+     * Calculate start checkpoint, if `initialCheckpoint` is non-zero,
+     * use that. Otherwise, use `startBlock`
      */
     const start =
-      encodeCheckpoint(args.initialCheckpoint) !==
-      encodeCheckpoint(zeroCheckpoint)
-        ? encodeCheckpoint(args.initialCheckpoint)
-        : getChainsCheckpoint("start")!;
+      args.initialCheckpoint !== encodeCheckpoint(zeroCheckpoint)
+        ? args.initialCheckpoint
+        : getOmnichainCheckpoint("start")!;
 
     // Cursor used to track progress.
     let from = start;
 
+    let showLogs = true;
     while (true) {
-      const _localSyncs = args.networks.map(
-        (network) => localSyncs.get(network)!,
+      const syncGenerator = mergeAsyncGenerators(
+        Array.from(localSyncContext.entries()).map(
+          ([network, { syncProgress, historicalSync }]) =>
+            localHistoricalSyncGenerator({
+              common: args.common,
+              network,
+              syncProgress,
+              historicalSync,
+              showLogs,
+            }),
+        ),
       );
-      // Sync the next interval of each chain.
-      await Promise.all(_localSyncs.map((l) => l.sync()));
-      /**
-       * `latestBlock` is used to calculate the `to` checkpoint, if any
-       * network hasn't yet ingested a block, run another iteration of this loop.
-       * It is an invariant that `latestBlock` will eventually be defined. See the
-       * implementation of `LocalSync.latestBlock` for more detail.
-       */
-      if (_localSyncs.some((l) => l.latestBlock === undefined)) continue;
-      /**
-       * Calculate the mininum "latest" checkpoint, falling back to `end` if
-       * all networks have completed.
-       *
-       * `end`: If every network has an `endBlock` and it's less than
-       * `finalized`, use that. Otherwise, use `finalized`
-       */
-      const end =
-        getChainsCheckpoint("end") !== undefined &&
-        getChainsCheckpoint("end")! < getChainsCheckpoint("finalized")!
-          ? getChainsCheckpoint("end")!
-          : getChainsCheckpoint("finalized")!;
-      const to = getChainsCheckpoint("latest") ?? end;
 
-      /*
-       * Extract events with `syncStore.getEvents()`, paginating to
-       * avoid loading too many events into memory.
-       */
-      while (true) {
-        if (isKilled) return;
-        if (from >= to) break;
+      // Only show logs on the first iteration
+      showLogs = false;
 
-        const getEventsMaxBatchSize = args.common.options.syncEventsQuerySize;
-        let consecutiveErrors = 0;
+      for await (const _ of syncGenerator) {
+        /**
+         * `current` is used to calculate the `to` checkpoint, if any
+         * network hasn't yet ingested a block, run another iteration of this loop.
+         * It is an invariant that `latestBlock` will eventually be defined.
+         */
+        if (
+          Array.from(localSyncContext.values()).some(
+            ({ syncProgress }) => syncProgress.current === undefined,
+          )
+        ) {
+          continue;
+        }
 
-        // convert `estimateSeconds` to checkpoint
-        const estimatedTo = encodeCheckpoint({
-          ...zeroCheckpoint,
-          blockTimestamp: Math.min(
-            decodeCheckpoint(from).blockTimestamp + estimateSeconds,
-            maxCheckpoint.blockTimestamp,
-          ),
-        });
+        // Calculate the mininum "current" checkpoint, limited by "finalized" and "end"
+        const to = min(
+          getOmnichainCheckpoint("end"),
+          getOmnichainCheckpoint("finalized"),
+          getOmnichainCheckpoint("current"),
+        );
 
-        try {
-          const { events, cursor } = await args.syncStore.getEvents({
-            filters: args.sources.map(({ filter }) => filter),
-            from,
-            to: to < estimatedTo ? to : estimatedTo,
-            limit: getEventsMaxBatchSize,
-          });
-          consecutiveErrors = 0;
+        /*
+         * Extract events with `syncStore.getEvents()`, paginating to
+         * avoid loading too many events into memory.
+         */
+        while (true) {
+          if (isKilled) return;
+          if (from >= to) break;
+          const getEventsMaxBatchSize = args.common.options.syncEventsQuerySize;
+          let consecutiveErrors = 0;
 
-          updateStatus(events, cursor, false);
-
-          estimateSeconds = estimate({
-            from: decodeCheckpoint(from).blockTimestamp,
-            to: decodeCheckpoint(cursor).blockTimestamp,
-            target: getEventsMaxBatchSize,
-            result: events.length,
-            min: 10,
-            max: 86_400,
-            prev: estimateSeconds,
-            maxIncrease: 1.08,
+          // convert `estimateSeconds` to checkpoint
+          const estimatedTo = encodeCheckpoint({
+            ...zeroCheckpoint,
+            blockTimestamp: Math.min(
+              decodeCheckpoint(from).blockTimestamp + estimateSeconds,
+              maxCheckpoint.blockTimestamp,
+            ),
           });
 
-          yield { events, checkpoint: to };
-          from = cursor;
-        } catch (error) {
-          // Handle errors by reducing the requested range by 10x
-          estimateSeconds = Math.max(10, Math.round(estimateSeconds / 10));
-          if (++consecutiveErrors > 4) throw error;
+          try {
+            const { events, cursor } = await args.syncStore.getEvents({
+              filters: args.sources.map(({ filter }) => filter),
+              from,
+              to: to < estimatedTo ? to : estimatedTo,
+              limit: getEventsMaxBatchSize,
+            });
+            consecutiveErrors = 0;
+
+            for (const network of args.networks) {
+              updateHistoricalStatus({ events, checkpoint: cursor, network });
+            }
+
+            estimateSeconds = estimate({
+              from: decodeCheckpoint(from).blockTimestamp,
+              to: decodeCheckpoint(cursor).blockTimestamp,
+              target: getEventsMaxBatchSize,
+              result: events.length,
+              min: 10,
+              max: 86_400,
+              prev: estimateSeconds,
+              maxIncrease: 1.08,
+            });
+
+            yield { events, checkpoint: to };
+            from = cursor;
+
+            // underlying metrics collection is actually synchronous
+            // https://github.com/siimon/prom-client/blob/master/lib/histogram.js#L102-L125
+            const { eta, progress } = await getAppProgress(args.common.metrics);
+
+            if (events.length > 0) {
+              if (eta === undefined || progress === undefined) {
+                args.common.logger.info({
+                  service: "app",
+                  msg: `Indexed ${events.length} events`,
+                });
+              } else {
+                args.common.logger.info({
+                  service: "app",
+                  msg: `Indexed ${events.length} events with ${formatPercentage(progress)} complete and ${formatEta(eta)} remaining`,
+                });
+              }
+            }
+          } catch (error) {
+            // Handle errors by reducing the requested range by 10x
+            estimateSeconds = Math.max(10, Math.round(estimateSeconds / 10));
+            if (++consecutiveErrors > 4) throw error;
+          }
         }
       }
 
-      // Exit condition: All network have completed historical sync.
-      if (
-        _localSyncs.every(
-          (localSync) =>
-            localSync.isComplete() ||
-            localSync.finalizedBlock === localSync.latestBlock,
-        )
-      ) {
-        /**
-         * Check how "fresh" the `finalized` blocks are. If they have been
-         * fetched within the threshold, exit the loop.
-         */
-        if (
-          latestFinalizedFetch + args.common.options.syncHandoffStaleSeconds >
-          Date.now() / 1_000
-        ) {
-          break;
+      /** `true` if all networks have synced all known finalized blocks.  */
+      const allHistoricalSyncExhaustive = Array.from(
+        localSyncContext.values(),
+      ).every(({ syncProgress }) => {
+        if (isSyncEnd(syncProgress)) return true;
+
+        // Determine if `finalized` block is considered "stale"
+        const staleSeconds = (Date.now() - latestFinalizedFetch) / 1_000;
+        if (staleSeconds <= args.common.options.syncHandoffStaleSeconds) {
+          return true;
         }
 
-        // Refetch finalized blocks for non-complete networks.
-        await Promise.all(
-          [...localSyncs].map(([network, localSync]) => {
-            if (localSync.isComplete()) return;
+        return false;
+      });
 
+      if (allHistoricalSyncExhaustive) break;
+
+      /** At least one network has a `finalized` block that is considered "stale". */
+
+      latestFinalizedFetch = Date.now();
+
+      await Promise.all(
+        Array.from(localSyncContext.entries()).map(
+          async ([network, { requestQueue, syncProgress }]) => {
             args.common.logger.debug({
               service: "sync",
               msg: `Refetching '${network.name}' finalized block`,
             });
 
-            return localSync.refetchFinalizedBlock();
-          }),
-        );
-        latestFinalizedFetch = Date.now() / 1_000;
-      }
+            const latestBlock = await _eth_getBlockByNumber(requestQueue, {
+              blockTag: "latest",
+            });
+
+            const finalizedBlockNumber = Math.max(
+              0,
+              hexToNumber(latestBlock.number) - network.finalityBlockCount,
+            );
+
+            syncProgress.finalized = await _eth_getBlockByNumber(requestQueue, {
+              blockNumber: finalizedBlockNumber,
+            });
+
+            const historicalLast = getHistoricalLast(syncProgress);
+
+            // Set metric "ponder_historical_total_blocks"
+            args.common.metrics.ponder_historical_total_blocks.set(
+              { network: network.name },
+              hexToNumber(historicalLast.number) -
+                hexToNumber(syncProgress.start.number) +
+                1,
+            );
+          },
+        ),
+      );
     }
   }
 
@@ -400,238 +606,629 @@ export const createSync = async (args: CreateSyncParameters): Promise<Sync> => {
    *
    * Handle callback events across all `args.networks`, and raising these
    * events to `args.onRealtimeEvent` while maintaining checkpoint ordering.
-   *
-   * Note: "block" events are still being handled by writing and reading from
-   * the sync-store. This approach is not future proof and inefficient.
    */
-  const eventQueue = createQueue({
-    browser: false,
-    concurrency: 1,
-    initialStart: true,
-    worker: async ({
-      network,
-      event,
-    }: { network: Network; event: RealtimeSyncEvent }) => {
-      const localSync = localSyncs.get(network)!;
-      const realtimeSync = realtimeSyncs.get(network)!;
-      switch (event.type) {
-        /**
-         * Handle a new block being ingested.
-         */
-        case "block":
-          {
-            // Update local sync, record checkpoint before and after
-            let from = getChainsCheckpoint("latest")!;
-            localSync.latestBlock = event.block;
-            const to = getChainsCheckpoint("latest")!;
+  const onRealtimeSyncEvent = async ({
+    network,
+    event,
+  }: { network: Network; event: RealtimeSyncEvent }) => {
+    const { syncProgress, realtimeSync, unfinalizedEventData } =
+      localSyncContext.get(network)!;
 
-            // Add block, logs, transactions, receipts, and traces to the sync-store.
+    switch (event.type) {
+      /**
+       * Handle a new block being ingested.
+       */
+      case "block": {
+        // Update local sync, record checkpoint before and after
+        const from = getOmnichainCheckpoint("current")!;
+        syncProgress.current = event.block;
+        const to = getOmnichainCheckpoint("current")!;
 
-            const chainId = network.chainId;
+        // Update "ponder_sync_block" metric
+        args.common.metrics.ponder_sync_block.set(
+          { network: network.name },
+          hexToNumber(syncProgress.current.number),
+        );
 
-            await Promise.all([
-              args.syncStore.insertBlocks({
-                blocks: event.filters.size === 0 ? [] : [event.block],
-                chainId,
-              }),
-              args.syncStore.insertLogs({
-                logs: event.logs.map((log) => ({ log, block: event.block })),
-                shouldUpdateCheckpoint: true,
-                chainId,
-              }),
-              args.syncStore.insertTransactions({
-                transactions: event.transactions,
-                chainId,
-              }),
-              args.syncStore.insertTransactionReceipts({
-                transactionReceipts: event.transactionReceipts,
-                chainId,
-              }),
-              args.syncStore.insertCallTraces({
-                callTraces: event.callTraces.map((callTrace) => ({
-                  callTrace,
-                  block: event.block,
-                })),
-                chainId,
-              }),
-            ]);
-
-            /*
-             * Extract events with `syncStore.getEvents()`, paginating to
-             * avoid loading too many events into memory.
-             */
-            while (true) {
-              if (isKilled) return;
-              if (from === to) break;
-              const { events, cursor } = await args.syncStore.getEvents({
-                filters: args.sources.map(({ filter }) => filter),
-                from,
-                to,
-                limit: args.common.options.syncEventsQuerySize,
-              });
-
-              updateStatus(events, cursor, true);
-              args.onRealtimeEvent({ type: "block", checkpoint: to, events });
-
-              from = cursor;
-            }
-          }
-          break;
-        /**
-         * Handle a new block being finalized.
-         */
-        case "finalize":
-          {
-            // Newly finalized range
-            const interval = [
-              hexToNumber(localSync.finalizedBlock.number),
-              hexToNumber(event.block.number),
-            ] satisfies Interval;
-
-            // Update local sync, record checkpoint before and after
-            const prev = getChainsCheckpoint("finalized")!;
-            localSync.finalizedBlock = event.block;
-            const checkpoint = getChainsCheckpoint("finalized")!;
-
-            const filters = args.sources
-              .filter(({ filter }) => filter.chainId === network.chainId)
-              .map(({ filter }) => filter);
-            // Insert an interval for the newly finalized range.
-            await Promise.all(
-              filters.map((filter) =>
-                args.syncStore.insertInterval({ filter, interval }),
-              ),
-            );
-
-            // Raise event to parent function (runtime)
-            if (checkpoint > prev) {
-              args.onRealtimeEvent({ type: "finalize", checkpoint });
-            }
-
-            /**
-             * The realtime service can be killed if `endBlock` is
-             * defined has become finalized.
-             */
-            if (localSync.isComplete()) {
-              args.common.metrics.ponder_realtime_is_connected.set(
-                { network: network.name },
-                0,
-              );
-              args.common.logger.info({
-                service: "sync",
-                msg: `Synced final end block for '${network.name}' (${hexToNumber(localSync.endBlock!.number)}), killing realtime sync service`,
-              });
-              await realtimeSync.kill();
-              // Delete syncs to remove `network` from checkpoint calculations
-              localSyncs.delete(network);
-              realtimeSyncs.delete(network);
-            }
-          }
-          break;
-        /**
-         * Handle a reorg with a new common ancestor block being found.
-         */
-        case "reorg":
-          {
-            // Update local sync
-            localSync.latestBlock = event.block;
-            const checkpoint = getChainsCheckpoint("latest")!;
-
-            await args.syncStore.pruneByBlock({
-              blocks: event.reorgedBlocks,
-              chainId: network.chainId,
-            });
-
-            args.onRealtimeEvent({ type: "reorg", checkpoint });
-          }
-          break;
-
-        default:
-          never(event);
-      }
-    },
-  });
-
-  return {
-    getEvents,
-    startRealtime() {
-      for (const network of args.networks) {
-        const localSync = localSyncs.get(network)!;
-
-        // Update status
-        status[network.name] = {
-          block: {
-            timestamp: hexToNumber(localSync.latestBlock!.timestamp),
-            number: hexToNumber(localSync.latestBlock!.number),
-          },
-          ready: true,
+        const blockWithEventData = {
+          block: event.block,
+          filters: event.filters,
+          logs: event.logs,
+          factoryLogs: event.factoryLogs,
+          traces: event.traces,
+          transactions: event.transactions,
+          transactionReceipts: event.transactionReceipts,
         };
 
-        // A `network` doesn't need a realtime sync if `endBlock` is finalized
-        if (localSync.isComplete()) {
-          // Delete sync to remove from checkpoint calculations
-          localSyncs.delete(network);
-        } else {
-          // Create and start realtime sync
-          const realtimeSync = createRealtimeSync({
-            common: args.common,
-            network,
-            requestQueue: localSync.requestQueue,
-            sources: args.sources.filter(
-              ({ filter }) => filter.chainId === network.chainId,
-            ),
-            syncStore: args.syncStore,
-            onEvent: (event) =>
-              eventQueue.add({ network, event }).catch((error) => {
-                args.common.logger.error({
-                  service: "sync",
-                  msg: `Fatal error: Unable to process ${event.type} event`,
-                  error,
+        unfinalizedEventData.push(blockWithEventData);
+
+        const events = buildEvents({
+          sources: args.sources,
+          chainId: network.chainId,
+          blockWithEventData,
+          finalizedChildAddresses: realtimeSync.finalizedChildAddresses,
+          unfinalizedChildAddresses: realtimeSync.unfinalizedChildAddresses,
+        });
+
+        pendingEvents.push(...events);
+
+        if (to > from) {
+          for (const network of args.networks) {
+            updateRealtimeStatus({ checkpoint: to, network });
+          }
+
+          const events = pendingEvents
+            .filter(({ checkpoint }) => checkpoint <= to)
+            .sort((a, b) => (a.checkpoint < b.checkpoint ? -1 : 1));
+
+          pendingEvents = pendingEvents.filter(
+            ({ checkpoint }) => checkpoint > to,
+          );
+
+          args
+            .onRealtimeEvent({
+              type: "block",
+              checkpoint: to,
+              status: structuredClone(status),
+              events,
+            })
+            .then(() => {
+              if (events.length > 0 && isKilled === false) {
+                args.common.logger.info({
+                  service: "app",
+                  msg: `Indexed ${events.length} events`,
                 });
-                args.onFatalError(error);
-              }),
-            onFatalError: args.onFatalError,
+              }
+            });
+        }
+
+        break;
+      }
+      /**
+       * Handle a new block being finalized.
+       */
+      case "finalize": {
+        // Newly finalized range
+        const interval = [
+          hexToNumber(syncProgress.finalized.number),
+          hexToNumber(event.block.number),
+        ] satisfies Interval;
+
+        // Update local sync, record checkpoint before and after
+        const prev = getOmnichainCheckpoint("finalized")!;
+        syncProgress.finalized = event.block;
+        const checkpoint = getOmnichainCheckpoint("finalized")!;
+
+        // Raise event to parent function (runtime)
+        if (checkpoint > prev) {
+          args.onRealtimeEvent({ type: "finalize", checkpoint });
+        }
+
+        const finalizedEventData = unfinalizedEventData.filter(
+          (ued) =>
+            hexToNumber(ued.block.number) <= hexToNumber(event.block.number),
+        );
+
+        localSyncContext.get(network)!.unfinalizedEventData =
+          unfinalizedEventData.filter(
+            (ued) =>
+              hexToNumber(ued.block.number) > hexToNumber(event.block.number),
+          );
+
+        if (
+          getChainCheckpoint({ syncProgress, network, tag: "finalized" })! >
+          getOmnichainCheckpoint("current")!
+        ) {
+          args.common.logger.warn({
+            service: "sync",
+            msg: `Finalized block for '${network.name}' has surpassed overall indexing checkpoint`,
           });
-          args.common.metrics.ponder_realtime_is_connected.set(
+        }
+
+        // Add finalized blocks, logs, transactions, receipts, and traces to the sync-store.
+
+        await Promise.all([
+          args.syncStore.insertBlocks({
+            blocks: finalizedEventData
+              .filter(({ filters }) => filters.size > 0)
+              .map(({ block }) => block),
+            chainId: network.chainId,
+          }),
+          args.syncStore.insertLogs({
+            logs: finalizedEventData.flatMap(({ logs, block }) =>
+              logs.map((log) => ({ log, block })),
+            ),
+            shouldUpdateCheckpoint: true,
+            chainId: network.chainId,
+          }),
+          args.syncStore.insertLogs({
+            logs: finalizedEventData.flatMap(({ factoryLogs }) =>
+              factoryLogs.map((log) => ({ log })),
+            ),
+            shouldUpdateCheckpoint: false,
+            chainId: network.chainId,
+          }),
+          args.syncStore.insertTransactions({
+            transactions: finalizedEventData.flatMap(
+              ({ transactions, block }) =>
+                transactions.map((transaction) => ({
+                  transaction,
+                  block,
+                })),
+            ),
+            chainId: network.chainId,
+          }),
+          args.syncStore.insertTransactionReceipts({
+            transactionReceipts: finalizedEventData.flatMap(
+              ({ transactionReceipts }) => transactionReceipts,
+            ),
+            chainId: network.chainId,
+          }),
+          args.syncStore.insertTraces({
+            traces: finalizedEventData.flatMap(
+              ({ traces, block, transactions }) =>
+                traces.map((trace) => ({
+                  trace,
+                  block,
+                  transaction: transactions.find(
+                    (t) => t.hash === trace.transactionHash,
+                  )!,
+                })),
+            ),
+            chainId: network.chainId,
+          }),
+        ]);
+
+        // Add corresponding intervals to the sync-store
+        // Note: this should happen after so the database doesn't become corrupted
+
+        if (network.disableCache === false) {
+          await args.syncStore.insertIntervals({
+            intervals: args.sources
+              .filter(({ filter }) => filter.chainId === network.chainId)
+              .map(({ filter }) => ({ filter, interval })),
+          });
+        }
+
+        /**
+         * The realtime service can be killed if `endBlock` is
+         * defined has become finalized.
+         */
+        if (isSyncEnd(syncProgress)) {
+          args.common.metrics.ponder_sync_is_realtime.set(
+            { network: network.name },
+            0,
+          );
+          args.common.metrics.ponder_sync_is_complete.set(
             { network: network.name },
             1,
           );
-          realtimeSync.start(localSync.finalizedBlock);
-          realtimeSyncs.set(network, realtimeSync);
+          args.common.logger.info({
+            service: "sync",
+            msg: `Synced final end block for '${network.name}' (${hexToNumber(syncProgress.end!.number)}), killing realtime sync service`,
+          });
+          realtimeSync.kill();
+        }
+        break;
+      }
+      /**
+       * Handle a reorg with a new common ancestor block being found.
+       */
+      case "reorg": {
+        syncProgress.current = event.block;
+        const checkpoint = getOmnichainCheckpoint("current")!;
+
+        // Update "ponder_sync_block" metric
+        args.common.metrics.ponder_sync_block.set(
+          { network: network.name },
+          hexToNumber(syncProgress.current.number),
+        );
+
+        localSyncContext.get(network)!.unfinalizedEventData =
+          unfinalizedEventData.filter(
+            (led) =>
+              hexToNumber(led.block.number) <= hexToNumber(event.block.number),
+          );
+
+        const reorgedHashes = new Set<Hash>();
+        for (const b of event.reorgedBlocks) {
+          reorgedHashes.add(b.hash);
+        }
+
+        pendingEvents = pendingEvents.filter(
+          (e) => reorgedHashes.has(e.block.hash) === false,
+        );
+
+        await args.syncStore.pruneRpcRequestResult({
+          blocks: event.reorgedBlocks,
+          chainId: network.chainId,
+        });
+
+        // Raise event to parent function (runtime)
+        args.onRealtimeEvent({ type: "reorg", checkpoint });
+
+        break;
+      }
+
+      default:
+        never(event);
+    }
+  };
+  return {
+    getEvents,
+    async startRealtime() {
+      for (const network of args.networks) {
+        const { syncProgress, realtimeSync } = localSyncContext.get(network)!;
+
+        status[network.name]!.block = {
+          number: hexToNumber(syncProgress.current!.number),
+          timestamp: hexToNumber(syncProgress.current!.timestamp),
+        };
+        status[network.name]!.ready = true;
+
+        if (isSyncEnd(syncProgress)) {
+          args.common.metrics.ponder_sync_is_complete.set(
+            { network: network.name },
+            1,
+          );
+        } else {
+          args.common.metrics.ponder_sync_is_realtime.set(
+            { network: network.name },
+            1,
+          );
+
+          const initialChildAddresses = new Map<Factory, Set<Address>>();
+
+          for (const { filter } of args.sources) {
+            if (
+              filter.chainId === network.chainId &&
+              "address" in filter &&
+              isAddressFactory(filter.address)
+            ) {
+              const addresses = await args.syncStore.getChildAddresses({
+                filter: filter.address,
+              });
+
+              initialChildAddresses.set(filter.address, new Set(addresses));
+            }
+          }
+
+          realtimeSync.start({ syncProgress, initialChildAddresses });
         }
       }
     },
     getStartCheckpoint() {
-      return getChainsCheckpoint("start")!;
+      return getOmnichainCheckpoint("start")!;
     },
     getFinalizedCheckpoint() {
-      return getChainsCheckpoint("finalized")!;
+      return getOmnichainCheckpoint("finalized")!;
     },
     getStatus() {
       return status;
     },
     getCachedTransport(network) {
-      const { requestQueue } = localSyncs.get(network)!;
+      const { requestQueue } = localSyncContext.get(network)!;
       return cachedTransport({ requestQueue, syncStore: args.syncStore });
     },
     async kill() {
       isKilled = true;
       const promises: Promise<void>[] = [];
       for (const network of args.networks) {
-        /**
-         * Some or all networks may be undefined, depending
-         * on progress and `endBlock` configuration.
-         */
-        localSyncs.get(network)?.kill();
-        const realtimeSync = realtimeSyncs.get(network);
-        if (realtimeSync) promises.push(realtimeSync.kill());
+        const { historicalSync, realtimeSync } = localSyncContext.get(network)!;
+        historicalSync.kill();
+        promises.push(realtimeSync.kill());
       }
-
-      eventQueue.pause();
-      eventQueue.clear();
-      promises.push(eventQueue.onIdle());
-
       await Promise.all(promises);
     },
   };
 };
+
+/** ... */
+export const syncDiagnostic = async ({
+  common,
+  sources,
+  network,
+  requestQueue,
+}: {
+  common: Common;
+  sources: Source[];
+  network: Network;
+  requestQueue: RequestQueue;
+}) => {
+  /** Earliest `startBlock` among all `filters` */
+  const start = Math.min(...sources.map(({ filter }) => filter.fromBlock ?? 0));
+  /**
+   * Latest `endBlock` among all filters. `undefined` if at least one
+   * of the filters doesn't have an `endBlock`.
+   */
+  const end = sources.some(({ filter }) => filter.toBlock === undefined)
+    ? undefined
+    : Math.max(...sources.map(({ filter }) => filter.toBlock!));
+
+  const [remoteChainId, startBlock, endBlock, latestBlock] = await Promise.all([
+    requestQueue.request({ method: "eth_chainId" }),
+    _eth_getBlockByNumber(requestQueue, { blockNumber: start }),
+    end === undefined
+      ? undefined
+      : _eth_getBlockByNumber(requestQueue, { blockNumber: end }),
+    _eth_getBlockByNumber(requestQueue, { blockTag: "latest" }),
+  ]);
+
+  // Warn if the config has a different chainId than the remote.
+  if (hexToNumber(remoteChainId) !== network.chainId) {
+    common.logger.warn({
+      service: "sync",
+      msg: `Remote chain ID (${remoteChainId}) does not match configured chain ID (${network.chainId}) for network "${network.name}"`,
+    });
+  }
+
+  const finalizedBlockNumber = Math.max(
+    0,
+    hexToNumber(latestBlock.number) - network.finalityBlockCount,
+  );
+
+  const finalizedBlock = await _eth_getBlockByNumber(requestQueue, {
+    blockNumber: finalizedBlockNumber,
+  });
+
+  return {
+    start: startBlock,
+    end: endBlock,
+    finalized: finalizedBlock,
+  };
+};
+
+/** Returns the closest-to-tip block that has been synced for all `sources`. */
+export const getCachedBlock = ({
+  sources,
+  requestQueue,
+  historicalSync,
+}: {
+  sources: Source[];
+  requestQueue: RequestQueue;
+  historicalSync: HistoricalSync;
+}): Promise<SyncBlock | LightBlock> | undefined => {
+  const latestCompletedBlocks = sources.map(({ filter }) => {
+    const requiredInterval = [
+      filter.fromBlock ?? 0,
+      filter.toBlock ?? Number.POSITIVE_INFINITY,
+    ] satisfies Interval;
+    const cachedIntervals = historicalSync.intervalsCache.get(filter)!;
+
+    const completedIntervals = sortIntervals(
+      intervalIntersection([requiredInterval], cachedIntervals),
+    );
+
+    if (completedIntervals.length === 0) return undefined;
+
+    const earliestCompletedInterval = completedIntervals[0]!;
+    if (earliestCompletedInterval[0] !== (filter.fromBlock ?? 0)) {
+      return undefined;
+    }
+    return earliestCompletedInterval[1];
+  });
+
+  const minCompletedBlock = Math.min(
+    ...(latestCompletedBlocks.filter(
+      (block) => block !== undefined,
+    ) as number[]),
+  );
+
+  /**  Filter i has known progress if a completed interval is found or if
+   * `_latestCompletedBlocks[i]` is undefined but `sources[i].filter.fromBlock`
+   * is > `_minCompletedBlock`.
+   */
+  if (
+    latestCompletedBlocks.every(
+      (block, i) =>
+        block !== undefined ||
+        (sources[i]!.filter.fromBlock ?? 0) > minCompletedBlock,
+    )
+  ) {
+    return _eth_getBlockByNumber(requestQueue, {
+      blockNumber: minCompletedBlock,
+    });
+  }
+
+  return undefined;
+};
+
+/** Predictive pagination and metrics for `historicalSync.sync()` */
+export async function* localHistoricalSyncGenerator({
+  common,
+  network,
+  syncProgress,
+  historicalSync,
+  showLogs,
+}: {
+  common: Common;
+  network: Network;
+  syncProgress: SyncProgress;
+  historicalSync: HistoricalSync;
+  showLogs: boolean;
+}): AsyncGenerator {
+  // Return immediately if the `syncProgress.start` is unfinalized
+  if (
+    hexToNumber(syncProgress.start.number) >
+    hexToNumber(syncProgress.finalized.number)
+  ) {
+    syncProgress.current = syncProgress.finalized;
+
+    // Update "ponder_sync_block" metric
+    common.metrics.ponder_sync_block.set(
+      { network: network.name },
+      hexToNumber(syncProgress.current.number),
+    );
+
+    if (showLogs) {
+      common.logger.warn({
+        service: "historical",
+        msg: `Skipped historical sync for '${network.name}' because the start block is not finalized`,
+      });
+    }
+
+    const label = { network: network.name };
+    // Set "ponder_historical_total_blocks"
+    common.metrics.ponder_historical_total_blocks.set(label, 0);
+    // Set "ponder_historical_sync_cached_blocks"
+    common.metrics.ponder_historical_cached_blocks.set(label, 0);
+
+    return;
+  }
+
+  const historicalLast = getHistoricalLast(syncProgress);
+
+  // Intialize metrics
+
+  const totalInterval = [
+    hexToNumber(syncProgress.start.number),
+    hexToNumber(historicalLast.number),
+  ] satisfies Interval;
+
+  const requiredIntervals = Array.from(
+    historicalSync.intervalsCache.entries(),
+  ).flatMap(([filter, interval]) =>
+    intervalDifference(
+      [
+        [
+          filter.fromBlock ?? 0,
+          Math.min(
+            filter.toBlock ?? Number.POSITIVE_INFINITY,
+            totalInterval[1],
+          ),
+        ],
+      ],
+      interval,
+    ),
+  );
+
+  const required = intervalSum(intervalUnion(requiredIntervals));
+
+  const total = totalInterval[1] - totalInterval[0] + 1;
+
+  const label = { network: network.name };
+  // Set "ponder_historical_total_blocks"
+  common.metrics.ponder_historical_total_blocks.set(label, total);
+  // Set "ponder_historical_sync_cached_blocks"
+  common.metrics.ponder_historical_cached_blocks.set(label, total - required);
+
+  if (showLogs) {
+    common.logger.info({
+      service: "historical",
+      msg: `Started syncing '${network.name}' with ${formatPercentage(
+        (total - required) / total,
+      )} cached`,
+    });
+  }
+
+  /**
+   * Estimate optimal range (blocks) to sync at a time, eventually to be used to
+   * determine `interval` passed to `historicalSync.sync()`.
+   */
+  let estimateRange = 25;
+  // Cursor to track progress.
+  let fromBlock = hexToNumber(syncProgress.start.number);
+
+  /**
+   * Handle a cache hit by fast forwarding and potentially exiting.
+   * A cache hit can either be: (listed by priority)
+   *   1) recovering progress from earlier invocations with different `finalized` blocks
+   *   2) recovering progress from the interval cache
+   */
+  if (
+    syncProgress.current !== undefined &&
+    (syncProgress.cached === undefined ||
+      hexToNumber(syncProgress.current.number) >
+        hexToNumber(syncProgress.cached.number))
+  ) {
+    fromBlock = hexToNumber(syncProgress.current.number) + 1;
+  } else if (syncProgress.cached !== undefined) {
+    // `getEvents` can make progress without calling `sync`, so immediately "yield"
+    yield;
+
+    if (
+      hexToNumber(syncProgress.cached.number) ===
+      hexToNumber(historicalLast.number)
+    ) {
+      if (showLogs) {
+        common.logger.info({
+          service: "historical",
+          msg: `Skipped historical sync for '${network.name}' because all blocks are cached.`,
+        });
+      }
+      return;
+    }
+
+    fromBlock = hexToNumber(syncProgress.cached.number) + 1;
+  }
+
+  while (true) {
+    /**
+     * Select a range of blocks to sync bounded by `finalizedBlock`.
+     *
+     * It is important for devEx that the interval is not too large, because
+     * time spent syncing ≈ time before indexing function feedback.
+     */
+    const interval: Interval = [
+      Math.min(fromBlock, hexToNumber(historicalLast.number)),
+      Math.min(fromBlock + estimateRange, hexToNumber(historicalLast.number)),
+    ];
+
+    const endClock = startClock();
+
+    const syncBlock = await historicalSync.sync(interval);
+
+    // Update cursor to record progress
+    fromBlock = interval[1] + 1;
+
+    if (syncBlock === undefined) {
+      /**
+       * `syncBlock` will be undefined if a cache hit occur in `historicalSync.sync()`.
+       * If the all known blocks are synced, then update `syncProgress.current`, else
+       * progress to the next iteration.
+       */
+      if (interval[1] === hexToNumber(historicalLast.number)) {
+        syncProgress.current = historicalLast;
+      } else {
+        continue;
+      }
+    } else {
+      if (interval[1] === hexToNumber(historicalLast.number)) {
+        syncProgress.current = historicalLast;
+      } else {
+        syncProgress.current = syncBlock;
+      }
+
+      const duration = endClock();
+
+      // Update "ponder_sync_block" metric
+      common.metrics.ponder_sync_block.set(
+        { network: network.name },
+        hexToNumber(syncProgress.current.number),
+      );
+
+      common.metrics.ponder_historical_duration.observe(label, duration);
+      common.metrics.ponder_historical_completed_blocks.inc(
+        label,
+        interval[1] - interval[0] + 1,
+      );
+
+      // Use the duration and interval of the last call to `sync` to update estimate
+      // 25 <= estimate(new) <= estimate(prev) * 2 <= 100_000
+      estimateRange = Math.min(
+        Math.max(
+          25,
+          Math.round((1_000 * (interval[1] - interval[0])) / duration),
+        ),
+        estimateRange * 2,
+        100_000,
+      );
+    }
+
+    yield;
+
+    if (isSyncEnd(syncProgress) || isSyncFinalized(syncProgress)) {
+      return;
+    }
+  }
+}

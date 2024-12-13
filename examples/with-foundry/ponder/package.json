@@ -10,9 +10,9 @@
     "typecheck": "tsc"
   },
   "dependencies": {
-    "@ponder/core": "workspace:*",
+    "ponder": "workspace:*",
     "hono": "^4.5.0",
-    "viem": "^1.19.3"
+    "viem": "^2.21.3"
   },
   "devDependencies": {
     "@types/node": "^20.9.0",

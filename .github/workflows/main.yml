@@ -53,14 +53,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        database: [Postgres, SQLite]
+        database: [Postgres, PGlite]
     steps:
       - name: Clone repository
         uses: actions/checkout@v4
 
       - name: Setup Postgres
         if: ${{ matrix.database == 'Postgres' }}
-        uses: ikalnytskyi/action-setup-postgres@v4
+        uses: ikalnytskyi/action-setup-postgres@v7
         id: postgres
 
       - name: Setup
@@ -112,7 +112,7 @@ jobs:
         with:
           cache: pnpm
           node-version: 20
-      
+
       - name: Install Bun
         if: ${{ matrix.runtime-version == 'Bun' }}
         uses: oven-sh/setup-bun@v1

@@ -9,7 +9,7 @@ import { Callout } from "nextra/components";
 
 Ideally, smart contracts emit event logs containing all the data you need to build your application. In practice, developers often forget to include certain event logs, or omit them as a gas optimization. In some cases, you can address these gaps by reading data directly from a contract.
 
-Ponder natively supports this pattern by injecting a custom [Viem Client](https://viem.sh/docs/clients/intro.html) into the indexing function context. This modified client automatically caches RPC requests and supports several RPC methods including `eth_call`, `multicall`, `eth_getStorageAt`, and `eth_getCode`.
+Ponder natively supports this pattern by injecting a custom [Viem Client](https://viem.sh/docs/clients/intro.html) into the indexing function context. This modified client automatically caches RPC requests and supports most standard Viem actions.
 
 ## Basic example
 
@@ -18,7 +18,7 @@ To read data from a contract, use `context.client.readContract(){:ts}` and inclu
 <div className="code-columns">
 
 ```ts filename="ponder.config.ts"
-import { createConfig } from "@ponder/core";
+import { createConfig } from "ponder";
 import { http } from "viem";
 
 import { BlitmapAbi } from "./abis/Blitmap";
@@ -42,7 +42,8 @@ export default createConfig({
 ```
 
 ```ts filename="src/index.ts"
-import { ponder } from "@/generated";
+import { ponder } from "ponder:registry";
+import { tokens } from "ponder:schema";
 
 ponder.on("Blitmap:Mint", async ({ event, context }) => {
   const { client } = context;
@@ -62,9 +63,9 @@ ponder.on("Blitmap:Mint", async ({ event, context }) => {
   });
 
   // Insert a Token record, including the URI.
-  const token = await context.db.Token.create({
+  await context.db.insert(tokens).values({
     id: event.args.tokenId,
-    data: { uri: tokenUri },
+    uri: tokenUri,
   });
 });
 ```
@@ -123,20 +124,36 @@ The custom client uses the transport you specify in `ponder.config.ts`.
 
 ### Supported actions
 
-| name         | description                                               | Viem docs                                                         |
-| :----------- | :-------------------------------------------------------- | :---------------------------------------------------------------- |
-| readContract | Returns the result of a read-only function on a contract. | [readContract](https://viem.sh/docs/contract/readContract.html)   |
-| multicall    | Similar to readContract, but batches requests.            | [multicall](https://viem.sh/docs/contract/multicall.html)         |
-| getBalance   | Returns the balance of an address in wei.                 | [getBalance](https://viem.sh/docs/actions/public/getBalance.html) |
-| getBytecode  | Returns the bytecode at an address.                       | [getBytecode](https://viem.sh/docs/contract/getBytecode.html)     |
-| getStorageAt | Returns the value from a storage slot at a given address. | [getStorageAt](https://viem.sh/docs/contract/getStorageAt.html)   |
+| name                        | description                                                                                         | Viem docs                                                                                      |
+| :-------------------------- | :-------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------- |
+| readContract                | Returns the result of a read-only function on a contract.                                           | [readContract](https://viem.sh/docs/contract/readContract.html)                                |
+| multicall                   | Similar to readContract, but batches requests.                                                      | [multicall](https://viem.sh/docs/contract/multicall.html)                                      |
+| simulateContract            | Simulates & validates a contract interaction.                                                       | [simulateContract](https://viem.sh/docs/contract/simulateContract)                             |
+| getBalance                  | Returns the balance of an address in wei.                                                           | [getBalance](https://viem.sh/docs/actions/public/getBalance.html)                              |
+| getBytecode                 | Returns the bytecode at an address.                                                                 | [getBytecode](https://viem.sh/docs/contract/getBytecode.html)                                  |
+| getStorageAt                | Returns the value from a storage slot at a given address.                                           | [getStorageAt](https://viem.sh/docs/contract/getStorageAt.html)                                |
+| getBlock                    | Returns information about a block at a block number, hash or tag.                                   | [getBlock](https://viem.sh/docs/actions/public/getBlock)                                       |
+| getTransactionCount         | Returns the number of transactions an account has broadcast / sent.                                 | [getTransactionCount](https://viem.sh/docs/actions/public/getTransactionCount)                 |
+| getBlockTransactionCount    | Returns the number of Transactions at a block number, hash or tag.                                  | [getBlockTransactionCount](https://viem.sh/docs/actions/public/getBlockTransactionCount)       |
+| getTransaction              | Returns information about a transaction given a hash or block identifier.                           | [getTransaction](https://viem.sh/docs/actions/public/getTransaction)                           |
+| getTransactionReceipt       | Returns the transaction receipt given a transaction hash.                                           | [getTransactionReceipt](https://viem.sh/docs/actions/public/getTransactionReceipt)             |
+| getTransactionConfirmations | Returns the number of blocks passed (confirmations) since the transaction was processed on a block. | [getTransactionConfirmations](https://viem.sh/docs/actions/public/getTransactionConfirmations) |
+| call                        | An Action for executing a new message call.                                                         | [call](https://viem.sh/docs/actions/public/call)                                               |
+| estimateGas                 | An Action for estimating gas for a transaction.                                                     | [estimateGas](https://viem.sh/docs/actions/public/estimateGas)                                 |
+| getFeeHistory               | Returns a collection of historical gas information.                                                 | [getFeeHistory](https://viem.sh/docs/actions/public/getFeeHistory)                             |
+| getProof                    | Returns the account and storage values of the specified account including the Merkle-proof.         | [getProof](https://viem.sh/docs/actions/public/getProof)                                       |
+| getEnsAddress               | Gets address for ENS name.                                                                          | [getEnsAddress](https://viem.sh/docs/ens/actions/getEnsAddress)                                |
+| getEnsAvatar                | Gets the avatar of an ENS name.                                                                     | [getEnsAvatar](https://viem.sh/docs/ens/actions/getEnsAvatar)                                  |
+| getEnsName                  | Gets primary name for specified address.                                                            | [getEnsName](https://viem.sh/docs/ens/actions/getEnsName)                                      |
+| getEnsResolver              | Gets resolver for ENS name.                                                                         | [getEnsResolver](https://viem.sh/docs/ens/actions/getEnsResolver)                              |
+| getEnsText                  | Gets a text record for specified ENS name.                                                          | [getEnsText](https://viem.sh/docs/ens/actions/getEnsText)                                      |
 
 ### Block number
 
 By default, the `blockNumber` option is set to the block number of the current event (`event.block.number`).
 
 ```ts filename="src/index.ts" {8-9}
-import { ponder } from "@/generated";
+import { ponder } from "ponder:registry";
 
 ponder.on("Blitmap:Mint", async ({ event, context }) => {
   const totalSupply = await context.client.readContract({
@@ -152,7 +169,7 @@ ponder.on("Blitmap:Mint", async ({ event, context }) => {
 You can also specify a `blockNumber` to read data at a specific block height. It will still be cached.
 
 ```ts filename="src/index.ts" {8}
-import { ponder } from "@/generated";
+import { ponder } from "ponder:registry";
 
 ponder.on("Blitmap:Mint", async ({ event, context }) => {
   const totalSupply = await context.client.readContract({
@@ -167,8 +184,6 @@ ponder.on("Blitmap:Mint", async ({ event, context }) => {
 <Callout>
   The `blockTag` option is not supported by custom client actions.
 </Callout>
-
-
 
 ### Caching
 
@@ -191,7 +206,7 @@ If a contract is configured to run on multiple networks, `context.contracts` con
 <div className="code-columns">
 
 ```ts filename="ponder.config.ts" {14-23}
-import { createConfig } from "@ponder/core";
+import { createConfig } from "ponder";
 import { http } from "viem";
 
 import { UniswapV3FactoryAbi } from "./abis/UniswapV3Factory";
@@ -220,7 +235,7 @@ export default createConfig({
 ```
 
 ```ts filename="src/index.ts"
-import { ponder } from "@/generated";
+import { ponder } from "ponder:registry";
 
 ponder.on("UniswapV3Factory:FeeAmountEnabled", async ({ event, context }) => {
   const tickSpacing = await context.client.readContract({
@@ -239,7 +254,7 @@ ponder.on("UniswapV3Factory:FeeAmountEnabled", async ({ event, context }) => {
 Contracts that are created by a factory have a dynamic address, so the `context.contracts` object does not have an `address` property. To read data from the contract that emitted the current event, use `event.log.address`.
 
 ```ts filename="src/index.ts" {9}
-import { ponder } from "@/generated";
+import { ponder } from "ponder:registry";
 
 ponder.on("SudoswapPool:Transfer", async ({ event, context }) => {
   const { SudoswapPool } = context.contracts;
@@ -256,7 +271,7 @@ ponder.on("SudoswapPool:Transfer", async ({ event, context }) => {
 To call a factory contract child from an indexing function for a _different_ contract, use your application logic to determine the correct address to enter. For example, the address might come from `event.args`.
 
 ```ts filename="src/index.ts" {6}
-import { ponder } from "@/generated";
+import { ponder } from "ponder:registry";
 
 ponder.on("FancyLendingProtocol:RegisterPool", async ({ event, context }) => {
   const totalSupply = await context.client.readContract({
@@ -276,7 +291,7 @@ To read from a contract without syncing & indexing event logs from it, import th
 <div className="code-columns">
 
 ```ts filename="ponder.config.ts"
-import { createConfig } from "@ponder/core";
+import { createConfig } from "ponder";
 
 import { AaveTokenAbi } from "./abis/AaveToken";
 
@@ -293,7 +308,7 @@ export default createConfig({
 ```
 
 ```ts filename="src/index.ts"
-import { ponder } from "@/generated";
+import { ponder } from "ponder:registry";
 
 import { ChainlinkPriceFeedAbi } from "../abis/ChainlinkPriceFeed";
 
@@ -333,11 +348,12 @@ contract ZorbNft is ERC721 {
 Every Zorb has a gradient, but the contract doesn't emit gradient data in any event logs (it only emits events required by ERC721). The gradient data for a given Zorb can, however, be accessed using the `gradientForAddress` function.
 
 ```ts filename="src/index.ts" {6-11}
-import { ponder } from "@/generated";
+import { ponder } from "ponder:registry";
+import { zorbs } from "ponder:schema";
 
 ponder.on("ZorbNft:Transfer", async ({ event, context }) => {
-  // If this is a mint, read gradient metadata from the contract.
   if (event.args.from === ZERO_ADDRESS) {
+    // If this is a mint, read gradient metadata from the contract.
     const gradientData = await context.client.readContract({
       abi: context.contracts.ZorbNft.abi,
       address: context.contracts.ZorbNft.address,
@@ -345,23 +361,16 @@ ponder.on("ZorbNft:Transfer", async ({ event, context }) => {
       args: [event.args.to],
     });
 
-    await context.db.Zorb.create({
+    await context.db.insert(zorbs).values({
       id: event.args.tokenId,
-      data: {
-        gradient: gradientData,
-        ownerId: event.args.to,
-      },
-    });
-
-    return;
-  }
-
-  // If not a mint, just update ownership information.
-  await context.db.Zorb.update({
-    id: event.args.tokenId,
-    data: {
+      gradient: gradientData,
       ownerId: event.args.to,
-    },
-  });
+    });
+  } else {
+    // If not a mint, just update ownership information.
+    await context.db
+      .update(zorbs, { id: event.args.tokenId })
+      .set({ ownerId: event.args.to });
+  }
 });
 ```

@@ -62,7 +62,7 @@ Ponder fetches event logs for the contracts added to `ponder.config.ts`, and pas
 ```ts
 // ponder.config.ts
 
-import { createConfig } from "@ponder/core";
+import { createConfig } from "ponder";
 import { http } from "viem";
  
 import { BaseRegistrarAbi } from "./abis/BaseRegistrar";
@@ -92,15 +92,12 @@ The `ponder.schema.ts` file contains the database schema, and defines the shape 
 ```ts
 // ponder.schema.ts
 
-import { createSchema } from "@ponder/core";
+import { onchainTable } from "ponder";
 
-export default createSchema((p) => ({
-  EnsName: p.createTable({
-    id: p.string(),
-    name: p.string(),
-    owner: p.string(),
-    registeredAt: p.int(),
-  }),
+export const ensName = onchainTable("ens_name", (t) => ({
+  name: p.text().primaryKey(),
+  owner: p.text().notNull(),
+  registeredAt: p.integer().notNull(),
 }));
 ```
 
@@ -111,19 +108,16 @@ Files in the `src/` directory contain **indexing functions**, which are TypeScri
 ```ts
 // src/BaseRegistrar.ts
 
-import { ponder } from "@/generated";
+import { ponder } from "ponder:registry";
+import schema from "ponder:schema";
 
 ponder.on("BaseRegistrar:NameRegistered", async ({ event, context }) => {
-  const { EnsName } = context.entities;
   const { name, owner } = event.params;
 
-  await EnsName.create({
-    id: `${name}-${owner}`,
-    data: {
-      name: name,
-      owner: owner,
-      registeredAt: event.block.timestamp,
-    },
+  await context.db.insert(schema.ensName).values({
+    name: name,
+    owner: owner,
+    registeredAt: event.block.timestamp,
   });
 });
 ```
@@ -173,7 +167,7 @@ If you're interested in contributing to Ponder, please read the [contribution gu
 
 ## Packages
 
-- `@ponder/core`
+- `ponder`
 - `@ponder/utils`
 - `create-ponder`
 - `eslint-config-ponder`
@@ -186,7 +180,7 @@ Ponder is MIT-licensed open-source software.
 [ci-url]: https://github.com/ponder-sh/ponder/actions/workflows/main.yml
 [tg-badge]: https://img.shields.io/endpoint?color=neon&logo=telegram&label=Chat&url=https%3A%2F%2Fmogyo.ro%2Fquart-apis%2Ftgmembercount%3Fchat_id%3Dponder_sh
 [tg-url]: https://t.me/ponder_sh
-[license-badge]: https://img.shields.io/npm/l/@ponder/core?label=License
+[license-badge]: https://img.shields.io/npm/l/ponder?label=License
 [license-url]: https://github.com/ponder-sh/ponder/blob/main/LICENSE
-[version-badge]: https://img.shields.io/npm/v/@ponder/core
+[version-badge]: https://img.shields.io/npm/v/ponder
 [version-url]: https://github.com/ponder-sh/ponder/releases

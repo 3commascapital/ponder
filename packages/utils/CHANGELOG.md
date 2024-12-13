@@ -1,5 +1,31 @@
 # @ponder/utils
 
+## 0.2.3
+
+### Patch Changes
+
+- [#1284](https://github.com/ponder-sh/ponder/pull/1284) [`0bb76fdc10bdf4f88980ed99d06c0e672094dce7`](https://github.com/ponder-sh/ponder/commit/0bb76fdc10bdf4f88980ed99d06c0e672094dce7) Thanks [@0xOlias](https://github.com/0xOlias)! - Improved eth_getLogs retry behavior for `https://mainnet.optimism.io`.
+
+## 0.2.2
+
+### Patch Changes
+
+- [#1193](https://github.com/ponder-sh/ponder/pull/1193) [`0cbdf01f85f4180a62d0de671c7adc299b704104`](https://github.com/ponder-sh/ponder/commit/0cbdf01f85f4180a62d0de671c7adc299b704104) Thanks [@kyscott18](https://github.com/kyscott18)! - Added retry range support for hyperliquid.
+
+## 0.2.1
+
+### Patch Changes
+
+- [#1110](https://github.com/ponder-sh/ponder/pull/1110) [`6a5c8a54b9d976fa760c863512044d82702d0bb7`](https://github.com/ponder-sh/ponder/commit/6a5c8a54b9d976fa760c863512044d82702d0bb7) Thanks [@chenxsan](https://github.com/chenxsan)! - Added retry mechanism for publicnode.
+
+## 0.2.0
+
+### Minor Changes
+
+- [#1074](https://github.com/ponder-sh/ponder/pull/1074) [`d9656a9af390f6c0a375cbbabfc85f90f510b13f`](https://github.com/ponder-sh/ponder/commit/d9656a9af390f6c0a375cbbabfc85f90f510b13f) Thanks [@kyscott18](https://github.com/kyscott18)! - Updated `viem` peer dependency to `>=2`.
+
+- [#1074](https://github.com/ponder-sh/ponder/pull/1074) [`d9656a9af390f6c0a375cbbabfc85f90f510b13f`](https://github.com/ponder-sh/ponder/commit/d9656a9af390f6c0a375cbbabfc85f90f510b13f) Thanks [@kyscott18](https://github.com/kyscott18)! - Added `isSuggestedRange` property to the return type of `getLogsRetryHelper`.
+
 ## 0.1.8
 
 ### Patch Changes

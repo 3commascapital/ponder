@@ -14,25 +14,25 @@ import {
   LimitExceededRpcError,
   type PublicRpcSchema,
   type RpcError,
-  type RpcLog,
-  hexToBigInt,
   isHex,
 } from "viem";
+import type { DebugRpcSchema } from "./debug.js";
 import { startClock } from "./timer.js";
 import { wait } from "./wait.js";
 
-type RequestReturnType<
-  method extends EIP1193Parameters<PublicRpcSchema>["method"],
-> = Extract<PublicRpcSchema[number], { Method: method }>["ReturnType"];
+type Schema = [...PublicRpcSchema, ...DebugRpcSchema];
+
+type RequestReturnType<method extends EIP1193Parameters<Schema>["method"]> =
+  Extract<Schema[number], { Method: method }>["ReturnType"];
 
 export type RequestQueue = Omit<
   Queue<
-    RequestReturnType<EIP1193Parameters<PublicRpcSchema>["method"]>,
-    EIP1193Parameters<PublicRpcSchema>
+    RequestReturnType<EIP1193Parameters<Schema>["method"]>,
+    EIP1193Parameters<Schema>
   >,
   "add"
 > & {
-  request: <TParameters extends EIP1193Parameters<PublicRpcSchema>>(
+  request: <TParameters extends EIP1193Parameters<Schema>>(
     parameters: TParameters,
   ) => Promise<RequestReturnType<TParameters["method"]>>;
 };
@@ -50,6 +50,7 @@ export const createRequestQueue = ({
   network: Network;
   common: Common;
 }): RequestQueue => {
+  // @ts-ignore
   const fetchRequest = async (request: EIP1193Parameters<PublicRpcSchema>) => {
     for (let i = 0; i <= RETRY_COUNT; i++) {
       try {
@@ -74,41 +75,10 @@ export const createRequestQueue = ({
             error: error as RpcError,
           });
 
-          if (getLogsErrorResponse.shouldRetry === false) throw error;
-
-          common.logger.debug({
-            service: "sync",
-            msg: `Caught eth_getLogs error on '${
-              network.name
-            }', retrying with ranges: [${getLogsErrorResponse.ranges
-              .map(
-                ({ fromBlock, toBlock }) =>
-                  `[${hexToBigInt(fromBlock).toString()}, ${hexToBigInt(toBlock).toString()}]`,
-              )
-              .join(", ")}].`,
-          });
-
-          const logs: RpcLog[] = [];
-          for (const { fromBlock, toBlock } of getLogsErrorResponse.ranges) {
-            const _logs = await fetchRequest({
-              method: "eth_getLogs",
-              params: [
-                {
-                  topics: request.params![0].topics,
-                  address: request.params![0].address,
-                  fromBlock,
-                  toBlock,
-                },
-              ],
-            });
-
-            logs.push(...(_logs as RpcLog[]));
-          }
-
-          return logs;
+          if (getLogsErrorResponse.shouldRetry === true) throw error;
         }
 
-        if (shouldRetry(request.method, error) === false) {
+        if (shouldRetry(error) === false) {
           common.logger.warn({
             service: "sync",
             msg: `Failed '${request.method}' RPC request`,
@@ -175,14 +145,10 @@ export const createRequestQueue = ({
 /**
  * @link https://github.com/wevm/viem/blob/main/src/utils/buildRequest.ts#L192
  */
-function shouldRetry(method: string, error: Error) {
+function shouldRetry(error: Error) {
   if ("code" in error && typeof error.code === "number") {
     if (error.code === -1) return true; // Unknown error
-    if (
-      (method === "trace_filter" || method === "eth_getLogs") &&
-      error.code === InvalidInputRpcError.code
-    )
-      return true;
+    if (error.code === InvalidInputRpcError.code) return true;
     if (error.code === LimitExceededRpcError.code) return true;
     if (error.code === InternalRpcError.code) return true;
     return false;

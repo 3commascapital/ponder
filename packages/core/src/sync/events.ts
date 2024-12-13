@@ -1,23 +1,56 @@
 import type { Common } from "@/common/common.js";
+import {
+  isBlockFilterMatched,
+  isLogFilterMatched,
+  isTraceFilterMatched,
+  isTransactionFilterMatched,
+  isTransferFilterMatched,
+} from "@/sync-realtime/filter.js";
+import type { BlockWithEventData } from "@/sync-realtime/index.js";
 import type {
   Block,
-  CallTrace,
   Log,
+  Trace,
   Transaction,
   TransactionReceipt,
+  Transfer,
 } from "@/types/eth.js";
+import type {
+  SyncBlock,
+  SyncLog,
+  SyncTrace,
+  SyncTransaction,
+  SyncTransactionReceipt,
+} from "@/types/sync.js";
+import {
+  EVENT_TYPES,
+  encodeCheckpoint,
+  maxCheckpoint,
+  zeroCheckpoint,
+} from "@/utils/checkpoint.js";
 import { never } from "@/utils/never.js";
 import { startClock } from "@/utils/timer.js";
 import type { AbiEvent, AbiParameter } from "abitype";
 import {
+  type Address,
   DecodeLogDataMismatch,
   DecodeLogTopicsMismatch,
+  type Hash,
   type Hex,
+  checksumAddress,
   decodeAbiParameters,
   decodeFunctionData,
   decodeFunctionResult,
+  hexToBigInt,
+  hexToNumber,
 } from "viem";
-import type { Source } from "./source.js";
+import {
+  type BlockFilter,
+  type Factory,
+  type Source,
+  isAddressFactory,
+  shouldGetTransactionReceipt,
+} from "./source.js";
 
 export type RawEvent = {
   chainId: number;
@@ -27,8 +60,15 @@ export type RawEvent = {
   block: Block;
   transaction?: Transaction;
   transactionReceipt?: TransactionReceipt;
-  trace?: CallTrace;
+  trace?: Trace;
 };
+
+export type Event =
+  | LogEvent
+  | BlockEvent
+  | TransactionEvent
+  | TransferEvent
+  | TraceEvent;
 
 export type SetupEvent = {
   type: "setup";
@@ -72,25 +112,349 @@ export type BlockEvent = {
   };
 };
 
-export type CallTraceEvent = {
-  type: "callTrace";
+export type TransactionEvent = {
+  type: "transaction";
   chainId: number;
   checkpoint: string;
 
-  /** `${source.name}.${safeName}()` */
+  /** `${source.name}.{safeName}()` */
   name: string;
 
   event: {
-    args: any;
-    result: any;
-    trace: CallTrace;
     block: Block;
     transaction: Transaction;
     transactionReceipt?: TransactionReceipt;
   };
 };
 
-export type Event = LogEvent | BlockEvent | CallTraceEvent;
+export type TransferEvent = {
+  type: "transfer";
+  chainId: number;
+  checkpoint: string;
+
+  /** `${source.name}:transfer:from` | `${source.name}:transfer:to` */
+  name: string;
+
+  event: {
+    transfer: Transfer;
+    block: Block;
+    transaction: Transaction;
+    transactionReceipt?: TransactionReceipt;
+    trace: Trace;
+  };
+};
+
+export type TraceEvent = {
+  type: "trace";
+  chainId: number;
+  checkpoint: string;
+
+  /** `${source.name}:transfer:from` | `${source.name}:transfer:to` */
+  name: string;
+
+  event: {
+    args: any;
+    result: any;
+    trace: Trace;
+    block: Block;
+    transaction: Transaction;
+    transactionReceipt?: TransactionReceipt;
+  };
+};
+
+/**
+ * Create `RawEvent`s from raw data types
+ */
+export const buildEvents = ({
+  sources,
+  blockWithEventData: {
+    block,
+    logs,
+    transactions,
+    transactionReceipts,
+    traces,
+  },
+  finalizedChildAddresses,
+  unfinalizedChildAddresses,
+  chainId,
+}: {
+  sources: Source[];
+  blockWithEventData: Omit<BlockWithEventData, "filters" | "factoryLogs">;
+  finalizedChildAddresses: Map<Factory, Set<Address>>;
+  unfinalizedChildAddresses: Map<Factory, Set<Address>>;
+  chainId: number;
+}) => {
+  const events: RawEvent[] = [];
+
+  const transactionCache = new Map<Hash, SyncTransaction>();
+  const transactionReceiptCache = new Map<Hash, SyncTransactionReceipt>();
+  for (const transaction of transactions) {
+    transactionCache.set(transaction.hash, transaction);
+  }
+  for (const transactionReceipt of transactionReceipts) {
+    transactionReceiptCache.set(
+      transactionReceipt.transactionHash,
+      transactionReceipt,
+    );
+  }
+
+  for (let i = 0; i < sources.length; i++) {
+    const source = sources[i]!;
+    const filter = source.filter;
+    if (chainId !== filter.chainId) continue;
+    switch (source.type) {
+      case "contract": {
+        switch (filter.type) {
+          case "log": {
+            for (const log of logs) {
+              if (
+                isLogFilterMatched({ filter, block, log }) &&
+                (isAddressFactory(filter.address)
+                  ? finalizedChildAddresses
+                      .get(filter.address)!
+                      .has(log.address) ||
+                    unfinalizedChildAddresses
+                      .get(filter.address)!
+                      .has(log.address)
+                  : true)
+              ) {
+                events.push({
+                  chainId: filter.chainId,
+                  sourceIndex: i,
+                  checkpoint: encodeCheckpoint({
+                    blockTimestamp: hexToNumber(block.timestamp),
+                    chainId: BigInt(filter.chainId),
+                    blockNumber: hexToBigInt(log.blockNumber),
+                    transactionIndex: hexToBigInt(log.transactionIndex),
+                    eventType: EVENT_TYPES.logs,
+                    eventIndex: hexToBigInt(log.logIndex),
+                  }),
+                  log: convertLog(log),
+                  block: convertBlock(block),
+                  transaction: convertTransaction(
+                    transactionCache.get(log.transactionHash)!,
+                  ),
+                  transactionReceipt: shouldGetTransactionReceipt(filter)
+                    ? convertTransactionReceipt(
+                        transactionReceiptCache.get(log.transactionHash)!,
+                      )
+                    : undefined,
+                  trace: undefined,
+                });
+              }
+            }
+            break;
+          }
+
+          case "trace": {
+            for (const trace of traces) {
+              const fromChildAddresses = isAddressFactory(filter.fromAddress)
+                ? [
+                    finalizedChildAddresses.get(filter.fromAddress)!,
+                    unfinalizedChildAddresses.get(filter.fromAddress)!,
+                  ]
+                : undefined;
+
+              const toChildAddresses = isAddressFactory(filter.toAddress)
+                ? [
+                    finalizedChildAddresses.get(filter.toAddress)!,
+                    unfinalizedChildAddresses.get(filter.toAddress)!,
+                  ]
+                : undefined;
+
+              if (
+                isTraceFilterMatched({
+                  filter,
+                  block,
+                  trace: trace.trace,
+                  fromChildAddresses,
+                  toChildAddresses,
+                }) &&
+                (filter.callType === undefined
+                  ? true
+                  : filter.callType === trace.trace.type) &&
+                (filter.includeReverted
+                  ? true
+                  : trace.trace.error === undefined)
+              ) {
+                const transaction = transactionCache.get(
+                  trace.transactionHash,
+                )!;
+                const transactionReceipt = transactionReceiptCache.get(
+                  trace.transactionHash,
+                )!;
+                events.push({
+                  chainId: filter.chainId,
+                  sourceIndex: i,
+                  checkpoint: encodeCheckpoint({
+                    blockTimestamp: hexToNumber(block.timestamp),
+                    chainId: BigInt(filter.chainId),
+                    blockNumber: hexToBigInt(block.number),
+                    transactionIndex: BigInt(transaction.transactionIndex),
+                    eventType: EVENT_TYPES.traces,
+                    eventIndex: BigInt(trace.trace.index),
+                  }),
+                  log: undefined,
+                  trace: convertTrace(trace),
+                  block: convertBlock(block),
+                  transaction: convertTransaction(transaction),
+                  transactionReceipt: shouldGetTransactionReceipt(filter)
+                    ? convertTransactionReceipt(transactionReceipt)
+                    : undefined,
+                });
+              }
+            }
+            break;
+          }
+        }
+        break;
+      }
+
+      case "account": {
+        switch (filter.type) {
+          case "transaction": {
+            for (const transaction of transactions) {
+              const fromChildAddresses = isAddressFactory(filter.fromAddress)
+                ? [
+                    finalizedChildAddresses.get(filter.fromAddress)!,
+                    unfinalizedChildAddresses.get(filter.fromAddress)!,
+                  ]
+                : undefined;
+
+              const toChildAddresses = isAddressFactory(filter.toAddress)
+                ? [
+                    finalizedChildAddresses.get(filter.toAddress)!,
+                    unfinalizedChildAddresses.get(filter.toAddress)!,
+                  ]
+                : undefined;
+
+              if (
+                isTransactionFilterMatched({
+                  filter,
+                  block,
+                  transaction,
+                  fromChildAddresses,
+                  toChildAddresses,
+                }) &&
+                (filter.includeReverted
+                  ? true
+                  : transactionReceiptCache.get(transaction.hash)!.status ===
+                    "0x1")
+              ) {
+                events.push({
+                  chainId: filter.chainId,
+                  sourceIndex: i,
+                  checkpoint: encodeCheckpoint({
+                    blockTimestamp: hexToNumber(block.timestamp),
+                    chainId: BigInt(filter.chainId),
+                    blockNumber: hexToBigInt(block.number),
+                    transactionIndex: BigInt(transaction.transactionIndex),
+                    eventType: EVENT_TYPES.transactions,
+                    eventIndex: 0n,
+                  }),
+                  log: undefined,
+                  trace: undefined,
+                  block: convertBlock(block),
+                  transaction: convertTransaction(transaction),
+                  transactionReceipt: convertTransactionReceipt(
+                    transactionReceiptCache.get(transaction.hash)!,
+                  ),
+                });
+              }
+            }
+            break;
+          }
+
+          case "transfer": {
+            for (const trace of traces) {
+              const fromChildAddresses = isAddressFactory(filter.fromAddress)
+                ? [
+                    finalizedChildAddresses.get(filter.fromAddress)!,
+                    unfinalizedChildAddresses.get(filter.fromAddress)!,
+                  ]
+                : undefined;
+
+              const toChildAddresses = isAddressFactory(filter.toAddress)
+                ? [
+                    finalizedChildAddresses.get(filter.toAddress)!,
+                    unfinalizedChildAddresses.get(filter.toAddress)!,
+                  ]
+                : undefined;
+
+              if (
+                isTransferFilterMatched({
+                  filter,
+                  block,
+                  trace: trace.trace,
+                  fromChildAddresses,
+                  toChildAddresses,
+                }) &&
+                (filter.includeReverted
+                  ? true
+                  : trace.trace.error === undefined)
+              ) {
+                const transaction = transactionCache.get(
+                  trace.transactionHash,
+                )!;
+                const transactionReceipt = transactionReceiptCache.get(
+                  trace.transactionHash,
+                )!;
+                events.push({
+                  chainId: filter.chainId,
+                  sourceIndex: i,
+                  checkpoint: encodeCheckpoint({
+                    blockTimestamp: hexToNumber(block.timestamp),
+                    chainId: BigInt(filter.chainId),
+                    blockNumber: hexToBigInt(block.number),
+                    transactionIndex: BigInt(transaction.transactionIndex),
+                    eventType: EVENT_TYPES.traces,
+                    eventIndex: BigInt(trace.trace.index),
+                  }),
+                  log: undefined,
+                  trace: convertTrace(trace),
+                  block: convertBlock(block),
+                  transaction: convertTransaction(transaction),
+                  transactionReceipt: shouldGetTransactionReceipt(filter)
+                    ? convertTransactionReceipt(transactionReceipt)
+                    : undefined,
+                });
+              }
+            }
+            break;
+          }
+        }
+        break;
+      }
+
+      case "block": {
+        if (isBlockFilterMatched({ filter: filter as BlockFilter, block })) {
+          events.push({
+            chainId: filter.chainId,
+            sourceIndex: i,
+            checkpoint: encodeCheckpoint({
+              blockTimestamp: hexToNumber(block.timestamp),
+              chainId: BigInt(filter.chainId),
+              blockNumber: hexToBigInt(block.number),
+              transactionIndex: maxCheckpoint.transactionIndex,
+              eventType: EVENT_TYPES.blocks,
+              eventIndex: zeroCheckpoint.eventIndex,
+            }),
+            block: convertBlock(block),
+            log: undefined,
+            trace: undefined,
+            transaction: undefined,
+            transactionReceipt: undefined,
+          });
+        }
+        break;
+      }
+      default:
+        never(source);
+    }
+  }
+
+  return events.sort((a, b) => (a.checkpoint < b.checkpoint ? -1 : 1));
+};
 
 export const decodeEvents = (
   common: Common,
@@ -105,18 +469,6 @@ export const decodeEvents = (
     const source = sources[event.sourceIndex]!;
 
     switch (source.type) {
-      case "block": {
-        events.push({
-          type: "block",
-          chainId: event.chainId,
-          checkpoint: event.checkpoint,
-          name: `${source.name}:block`,
-          event: {
-            block: event.block,
-          },
-        });
-        break;
-      }
       case "contract": {
         switch (source.filter.type) {
           case "log": {
@@ -154,24 +506,32 @@ export const decodeEvents = (
                 },
               });
             } catch (err) {
-              // TODO(kyle) Because we are strictly setting all `topics` now, this should be a bigger error.
-              common.logger.debug({
-                service: "app",
-                msg: `Unable to decode log, skipping it. id: ${event.log?.id}, data: ${event.log?.data}, topics: ${event.log?.topics}`,
-              });
+              if (source.filter.address === undefined) {
+                common.logger.debug({
+                  service: "app",
+                  msg: `Unable to decode log, skipping it. id: ${event.log?.id}, data: ${event.log?.data}, topics: ${event.log?.topics}`,
+                });
+              } else {
+                common.logger.warn({
+                  service: "app",
+                  msg: `Unable to decode log, skipping it. id: ${event.log?.id}, data: ${event.log?.data}, topics: ${event.log?.topics}`,
+                });
+              }
             }
             break;
           }
 
-          case "callTrace": {
+          case "trace": {
             try {
-              const selector = event.trace!.input.slice(0, 10) as Hex;
+              const selector = event
+                .trace!.input.slice(0, 10)
+                .toLowerCase() as Hex;
 
               if (source.abiFunctions.bySelector[selector] === undefined) {
                 throw new Error();
               }
 
-              const { safeName, item } =
+              const { item, safeName } =
                 source.abiFunctions.bySelector[selector]!;
 
               const { args, functionName } = decodeFunctionData({
@@ -181,15 +541,16 @@ export const decodeEvents = (
 
               const result = decodeFunctionResult({
                 abi: [item],
-                data: event.trace!.output,
+                data: event.trace!.output!,
                 functionName,
               });
 
               events.push({
-                type: "callTrace",
+                type: "trace",
                 chainId: event.chainId,
                 checkpoint: event.checkpoint,
 
+                // NOTE: `safename` includes ()
                 name: `${source.name}.${safeName}`,
 
                 event: {
@@ -202,10 +563,17 @@ export const decodeEvents = (
                 },
               });
             } catch (err) {
-              common.logger.debug({
-                service: "app",
-                msg: `Unable to decode trace, skipping it. id: ${event.trace?.id}, input: ${event.trace?.input}, output: ${event.trace?.output}`,
-              });
+              if (source.filter.toAddress === undefined) {
+                common.logger.debug({
+                  service: "app",
+                  msg: `Unable to decode trace, skipping it. id: ${event.trace?.id}, input: ${event.trace?.input}, output: ${event.trace?.output}`,
+                });
+              } else {
+                common.logger.warn({
+                  service: "app",
+                  msg: `Unable to decode trace, skipping it. id: ${event.trace?.id}, input: ${event.trace?.input}, output: ${event.trace?.output}`,
+                });
+              }
             }
             break;
           }
@@ -213,6 +581,70 @@ export const decodeEvents = (
           default:
             never(source.filter);
         }
+        break;
+      }
+
+      case "account": {
+        switch (source.filter.type) {
+          case "transaction": {
+            const isFrom = source.filter.toAddress === undefined;
+
+            events.push({
+              type: "transaction",
+              chainId: event.chainId,
+              checkpoint: event.checkpoint,
+
+              name: `${source.name}:transaction:${isFrom ? "from" : "to"}`,
+
+              event: {
+                block: event.block,
+                transaction: event.transaction!,
+                transactionReceipt: event.transactionReceipt,
+              },
+            });
+
+            break;
+          }
+
+          case "transfer": {
+            const isFrom = source.filter.toAddress === undefined;
+
+            events.push({
+              type: "transfer",
+              chainId: event.chainId,
+              checkpoint: event.checkpoint,
+
+              name: `${source.name}:transfer:${isFrom ? "from" : "to"}`,
+
+              event: {
+                transfer: {
+                  from: event.trace!.from,
+                  to: event.trace!.to!,
+                  value: event.trace!.value!,
+                },
+                block: event.block,
+                transaction: event.transaction!,
+                transactionReceipt: event.transactionReceipt,
+                trace: event.trace!,
+              },
+            });
+
+            break;
+          }
+        }
+        break;
+      }
+
+      case "block": {
+        events.push({
+          type: "block",
+          chainId: event.chainId,
+          checkpoint: event.checkpoint,
+          name: `${source.name}:block`,
+          event: {
+            block: event.block,
+          },
+        });
         break;
       }
 
@@ -296,3 +728,130 @@ function decodeTopic({ param, value }: { param: AbiParameter; value: Hex }) {
   const decodedArg = decodeAbiParameters([param], value) || [];
   return decodedArg[0];
 }
+
+const convertBlock = (block: SyncBlock): Block => ({
+  baseFeePerGas: block.baseFeePerGas ? hexToBigInt(block.baseFeePerGas) : null,
+  difficulty: hexToBigInt(block.difficulty),
+  extraData: block.extraData,
+  gasLimit: hexToBigInt(block.gasLimit),
+  gasUsed: hexToBigInt(block.gasUsed),
+  hash: block.hash,
+  logsBloom: block.logsBloom,
+  miner: checksumAddress(block.miner),
+  mixHash: block.mixHash,
+  nonce: block.nonce,
+  number: hexToBigInt(block.number),
+  parentHash: block.parentHash,
+  receiptsRoot: block.receiptsRoot,
+  sha3Uncles: block.sha3Uncles,
+  size: hexToBigInt(block.size),
+  stateRoot: block.stateRoot,
+  timestamp: hexToBigInt(block.timestamp),
+  totalDifficulty: block.totalDifficulty
+    ? hexToBigInt(block.totalDifficulty)
+    : null,
+  transactionsRoot: block.transactionsRoot,
+});
+
+const convertLog = (log: SyncLog): Log => ({
+  id: `${log.blockHash}-${log.logIndex}`,
+  address: checksumAddress(log.address!),
+  data: log.data,
+  logIndex: Number(log.logIndex),
+  removed: false,
+  topics: log.topics,
+});
+
+const convertTransaction = (transaction: SyncTransaction): Transaction => ({
+  from: checksumAddress(transaction.from),
+  gas: hexToBigInt(transaction.gas),
+  hash: transaction.hash,
+  input: transaction.input,
+  nonce: Number(transaction.nonce),
+  r: transaction.r,
+  s: transaction.s,
+  to: transaction.to ? checksumAddress(transaction.to) : transaction.to,
+  transactionIndex: Number(transaction.transactionIndex),
+  value: hexToBigInt(transaction.value),
+  v: transaction.v ? hexToBigInt(transaction.v) : null,
+  ...(transaction.type === "0x0"
+    ? {
+        type: "legacy",
+        gasPrice: hexToBigInt(transaction.gasPrice),
+      }
+    : transaction.type === "0x1"
+      ? {
+          type: "eip2930",
+          gasPrice: hexToBigInt(transaction.gasPrice),
+          accessList: transaction.accessList,
+        }
+      : transaction.type === "0x2"
+        ? {
+            type: "eip1559",
+            maxFeePerGas: hexToBigInt(transaction.maxFeePerGas),
+            maxPriorityFeePerGas: hexToBigInt(transaction.maxPriorityFeePerGas),
+          }
+        : // @ts-ignore
+          transaction.type === "0x7e"
+          ? {
+              type: "deposit",
+              // @ts-ignore
+              maxFeePerGas: transaction.maxFeePerGas
+                ? // @ts-ignore
+                  hexToBigInt(transaction.maxFeePerGas)
+                : undefined,
+              // @ts-ignore
+              maxPriorityFeePerGas: transaction.maxPriorityFeePerGas
+                ? // @ts-ignore
+                  hexToBigInt(transaction.maxPriorityFeePerGas)
+                : undefined,
+            }
+          : {
+              // @ts-ignore
+              type: transaction.type,
+            }),
+});
+
+const convertTransactionReceipt = (
+  transactionReceipt: SyncTransactionReceipt,
+): TransactionReceipt => ({
+  contractAddress: transactionReceipt.contractAddress
+    ? checksumAddress(transactionReceipt.contractAddress)
+    : null,
+  cumulativeGasUsed: hexToBigInt(transactionReceipt.cumulativeGasUsed),
+  effectiveGasPrice: hexToBigInt(transactionReceipt.effectiveGasPrice),
+  from: checksumAddress(transactionReceipt.from),
+  gasUsed: hexToBigInt(transactionReceipt.gasUsed),
+  logsBloom: transactionReceipt.logsBloom,
+  status:
+    transactionReceipt.status === "0x1"
+      ? "success"
+      : transactionReceipt.status === "0x0"
+        ? "reverted"
+        : (transactionReceipt.status as TransactionReceipt["status"]),
+  to: transactionReceipt.to ? checksumAddress(transactionReceipt.to) : null,
+  type:
+    transactionReceipt.type === "0x0"
+      ? "legacy"
+      : transactionReceipt.type === "0x1"
+        ? "eip2930"
+        : transactionReceipt.type === "0x2"
+          ? "eip1559"
+          : transactionReceipt.type === "0x7e"
+            ? "deposit"
+            : transactionReceipt.type,
+});
+
+const convertTrace = (trace: SyncTrace): Trace => ({
+  id: `${trace.transactionHash}-${trace.trace.index}`,
+  type: trace.trace.type,
+  from: checksumAddress(trace.trace.from),
+  to: trace.trace.to ? checksumAddress(trace.trace.to) : null,
+  input: trace.trace.input,
+  output: trace.trace.output,
+  gas: hexToBigInt(trace.trace.gas),
+  gasUsed: hexToBigInt(trace.trace.gasUsed),
+  value: trace.trace.value ? hexToBigInt(trace.trace.value) : null,
+  traceIndex: trace.trace.index,
+  subcalls: trace.trace.subcalls,
+});

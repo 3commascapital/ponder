@@ -1,5 +1,107 @@
 # create-ponder
 
+## 0.8.3
+
+## 0.8.2
+
+## 0.8.1
+
+## 0.8.0
+
+## 0.7.17
+
+## 0.7.16
+
+## 0.7.15
+
+## 0.7.14
+
+## 0.7.13
+
+## 0.7.12
+
+## 0.7.11
+
+## 0.7.10
+
+## 0.7.9
+
+## 0.7.8
+
+## 0.7.7
+
+## 0.7.6
+
+## 0.7.5
+
+## 0.7.4
+
+## 0.7.3
+
+## 0.7.2
+
+## 0.7.1
+
+## 0.7.0
+
+## 0.6.25
+
+## 0.6.24
+
+## 0.6.23
+
+## 0.6.22
+
+## 0.6.21
+
+## 0.6.20
+
+## 0.6.19
+
+## 0.6.18
+
+## 0.6.17
+
+## 0.6.16
+
+## 0.6.15
+
+## 0.6.14
+
+## 0.6.13
+
+## 0.6.12
+
+## 0.6.11
+
+## 0.6.10
+
+## 0.6.9
+
+## 0.6.8
+
+## 0.6.7
+
+## 0.6.6
+
+## 0.6.5
+
+## 0.6.4
+
+## 0.6.3
+
+## 0.6.2
+
+## 0.6.1
+
+## 0.6.0
+
+### Minor Changes
+
+- [#1074](https://github.com/ponder-sh/ponder/pull/1074) [`d9656a9af390f6c0a375cbbabfc85f90f510b13f`](https://github.com/ponder-sh/ponder/commit/d9656a9af390f6c0a375cbbabfc85f90f510b13f) Thanks [@kyscott18](https://github.com/kyscott18)! - Updated `viem` peer dependency to `>=2`.
+
+## 0.5.24
+
 ## 0.5.23
 
 ## 0.5.22
@@ -454,7 +556,7 @@
 
 ### Patch Changes
 
-- [#123](https://github.com/0xOlias/ponder/pull/123) [`9d6f820`](https://github.com/0xOlias/ponder/commit/9d6f820e9d0d1815aa6ebf7b001c0a3139c58f7c) Thanks [@0xOlias](https://github.com/0xOlias)! - Migrated to viem and added `@/generated` alias in generated handler code
+- [#123](https://github.com/0xOlias/ponder/pull/123) [`9d6f820`](https://github.com/0xOlias/ponder/commit/9d6f820e9d0d1815aa6ebf7b001c0a3139c58f7c) Thanks [@0xOlias](https://github.com/0xOlias)! - Migrated to viem and added `ponder:registry` alias in generated handler code
 
 ## 0.0.39
 

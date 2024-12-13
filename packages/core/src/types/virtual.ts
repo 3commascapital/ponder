@@ -6,18 +6,18 @@ import type {
   SafeEventNames,
   SafeFunctionNames,
 } from "@/config/utilityTypes.js";
+import type { Drizzle, Schema } from "@/drizzle/index.js";
 import type { ReadOnlyClient } from "@/indexing/ponderActions.js";
-import type { Schema as BuilderSchema } from "@/schema/common.js";
-import type { InferSchemaType } from "@/schema/infer.js";
 import type {
   Block,
-  CallTrace,
   Log,
+  Trace,
   Transaction,
   TransactionReceipt,
+  Transfer,
 } from "@/types/eth.js";
-import type { DatabaseModel } from "@/types/model.js";
-import type { ApiRegistry, ApiContext as _ApiContext } from "./api.js";
+import type { ApiRegistry } from "./api.js";
+import type { Db } from "./db.js";
 import type { Prettify } from "./utils.js";
 
 export namespace Virtual {
@@ -45,14 +45,18 @@ export namespace Virtual {
     safeFunctionNames = SafeFunctionNames<contract["abi"]>,
   > = string extends safeFunctionNames ? never : safeFunctionNames;
 
-  /** "{ContractName}:{EventName}" | "{ContractName}.{FunctionName}()" | "{SourceName}:block" . */
+  /** "{ContractName}:{EventName}" | "{ContractName}.{FunctionName}()" | "{SourceName}:block" | "{SourceName}:transaction:from" . */
   export type FormatEventNames<
     contracts extends Config["contracts"],
+    accounts extends Config["accounts"],
     blocks extends Config["blocks"],
   > =
     | {
         [name in keyof contracts]: `${name & string}:${_FormatEventNames<contracts[name]> | Setup}`;
       }[keyof contracts]
+    | {
+        [name in keyof accounts]: `${name & string}:${"transaction" | "transfer"}:${"from" | "to"}`;
+      }[keyof accounts]
     | {
         [name in keyof blocks]: `${name & string}:block`;
       }[keyof blocks]
@@ -66,12 +70,9 @@ export namespace Virtual {
       }[keyof contracts];
 
   type FormatTransactionReceipts<
-    contract extends Config["contracts"][string],
+    source extends Config["contracts" | "accounts"][string],
     ///
-    includeTxr = ExtractOverridenProperty<
-      contract,
-      "includeTransactionReceipts"
-    >,
+    includeTxr = ExtractOverridenProperty<source, "includeTransactionReceipts">,
   > = includeTxr extends includeTxr
     ? includeTxr extends true
       ? {
@@ -98,6 +99,7 @@ export namespace Virtual {
 
   export type EventNames<config extends Config> = FormatEventNames<
     config["contracts"],
+    config["accounts"],
     config["blocks"]
   >;
 
@@ -105,40 +107,59 @@ export namespace Virtual {
     config extends Config,
     name extends EventNames<config>,
     ///
-    contractName extends ExtractSourceName<name> = ExtractSourceName<name>,
+    sourceName extends ExtractSourceName<name> = ExtractSourceName<name>,
     eventName extends ExtractEventName<name> = ExtractEventName<name>,
   > = name extends `${string}:block`
-    ? { block: Prettify<Block> }
-    : name extends `${string}.${string}`
-      ? Prettify<
+    ? // 1. block event
+      { block: Prettify<Block> }
+    : name extends `${string}:transaction:${"from" | "to"}`
+      ? // 2. transaction event
+        {
+          block: Prettify<Block>;
+          transaction: Prettify<Transaction>;
+          transactionReceipt: Prettify<TransactionReceipt>;
+        }
+      : name extends `${string}:transfer:${"from" | "to"}`
+        ? // 3. transfer event
           {
-            args: FormatFunctionArgs<
-              config["contracts"][contractName]["abi"],
-              eventName
-            >;
-            result: FormatFunctionResult<
-              config["contracts"][contractName]["abi"],
-              eventName
-            >;
-            trace: Prettify<CallTrace>;
+            transfer: Prettify<Transfer>;
             block: Prettify<Block>;
             transaction: Prettify<Transaction>;
-          } & FormatTransactionReceipts<config["contracts"][contractName]>
-        >
-      : eventName extends Setup
-        ? never
-        : Prettify<
-            {
-              name: eventName;
-              args: FormatEventArgs<
-                config["contracts"][contractName]["abi"],
-                eventName
+            trace: Prettify<Trace>;
+          } & FormatTransactionReceipts<config["accounts"][sourceName]>
+        : name extends `${string}.${string}`
+          ? // 4. call trace event
+            Prettify<
+              {
+                args: FormatFunctionArgs<
+                  config["contracts"][sourceName]["abi"],
+                  eventName
+                >;
+                result: FormatFunctionResult<
+                  config["contracts"][sourceName]["abi"],
+                  eventName
+                >;
+                trace: Prettify<Trace>;
+                block: Prettify<Block>;
+                transaction: Prettify<Transaction>;
+              } & FormatTransactionReceipts<config["contracts"][sourceName]>
+            >
+          : eventName extends Setup
+            ? // 5. setup event
+              never
+            : // 6. log event
+              Prettify<
+                {
+                  name: eventName;
+                  args: FormatEventArgs<
+                    config["contracts"][sourceName]["abi"],
+                    eventName
+                  >;
+                  log: Prettify<Log>;
+                  block: Prettify<Block>;
+                  transaction: Prettify<Transaction>;
+                } & FormatTransactionReceipts<config["contracts"][sourceName]>
               >;
-              log: Prettify<Log>;
-              block: Prettify<Block>;
-              transaction: Prettify<Transaction>;
-            } & FormatTransactionReceipts<config["contracts"][contractName]>
-          >;
 
   type ContextContractProperty = Exclude<
     keyof Config["contracts"][string],
@@ -146,7 +167,7 @@ export namespace Virtual {
   >;
 
   type ExtractOverridenProperty<
-    contract extends Config["contracts"][string],
+    contract extends Config["contracts" | "accounts"][string],
     property extends ContextContractProperty,
     ///
     base = Extract<contract, { [p in property]: unknown }>[property],
@@ -158,7 +179,7 @@ export namespace Virtual {
 
   export type Context<
     config extends Config,
-    schema extends BuilderSchema,
+    schema extends Schema,
     name extends EventNames<config>,
     ///
     sourceName extends ExtractSourceName<name> = ExtractSourceName<name>,
@@ -203,44 +224,20 @@ export namespace Virtual {
               keyof config["networks"]]["chainId"];
           };
         }[keyof sourceNetwork];
-    client: Prettify<
-      Omit<
-        ReadOnlyClient,
-        | "extend"
-        | "key"
-        | "batch"
-        | "cacheTime"
-        | "account"
-        | "type"
-        | "uid"
-        | "chain"
-        | "name"
-        | "pollingInterval"
-        | "transport"
-      >
-    >;
-    db: {
-      [key in keyof InferSchemaType<schema>]: DatabaseModel<
-        // @ts-ignore
-        InferSchemaType<schema>[key]
-      >;
-    };
+    client: Prettify<ReadOnlyClient>;
+    db: Db<schema>;
   };
-
-  export type Drizzle<schema extends BuilderSchema> = _ApiContext<schema>;
 
   export type IndexingFunctionArgs<
     config extends Config,
-    schema extends BuilderSchema,
+    schema extends Schema,
     name extends EventNames<config>,
   > = {
     event: Event<config, name>;
     context: Context<config, schema, name>;
   };
 
-  export type Schema<schema extends BuilderSchema> = InferSchemaType<schema>;
-
-  export type Registry<config extends Config, schema extends BuilderSchema> = {
+  export type Registry<config extends Config, schema extends Schema> = {
     on: <name extends EventNames<config>>(
       _name: name,
       indexingFunction: (
@@ -250,4 +247,8 @@ export namespace Virtual {
       ) => Promise<void> | void,
     ) => void;
   } & ApiRegistry<schema>;
+
+  export type ApiContext<schema extends Schema> = {
+    db: Drizzle<schema>;
+  };
 }

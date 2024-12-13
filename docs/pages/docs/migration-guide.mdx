@@ -4,11 +4,567 @@ description: "A guide for migrating to new versions of Ponder."
 ---
 
 import { FileTree, Steps, Tabs, Callout } from "nextra/components";
-import Architecture from "../../public/architecture.svg";
 
 # Migration guide
 
+## 0.8
+
+<Callout type="warning">
+  This release includes an irreversible migration to the `ponder_sync` schema (RPC request cache). Once you run a `0.8` app against a database, you can no longer run `<=0.7` apps against the same database.
+</Callout>
+
+### Database management
+
+Ponder now requires the database schema to be explicitly specified with an environment variable or CLI flag. **`onchainSchema()` is removed.**
+
+<div className="code-columns">
+
+```bash filename=".env.local"
+DATABASE_SCHEMA=my_schema
+```
+
+```bash filename="shell"
+ponder start --schema my_schema
+```
+
+</div>
+
+<Callout type="info">
+  Each deployment/instance of a Ponder app must have it's own schema, with some
+  exceptions for `ponder dev` and crash recovery. [Read
+  more](/docs/getting-started/database#database-schema).
+</Callout>
+
+#### Railway
+
+Railway users should [update the start command](/docs/production/deploy#create-a-ponder-app-service) to include a database schema.
+
+{/* prettier-ignore */}
+<Tabs items={["pnpm", "yarn", "npm"]}>
+  <Tabs.Tab>
+```text filename="Start command"
+pnpm start --schema $RAILWAY_DEPLOYMENT_ID
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```text filename="Start command"
+yarn start --schema $RAILWAY_DEPLOYMENT_ID
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```text filename="Start command"
+npm run start --schema $RAILWAY_DEPLOYMENT_ID
+```
+</Tabs.Tab>
+</Tabs>
+
+#### `ponder db list`
+
+A new command was added for more visibility into which database schemas are being used.
+
+```bash filename="shell"
+$ ponder db list
+
+│ Schema        │ Active   │ Last active    │ Table count │
+├───────────────┼──────────┼────────────────┼─────────────┤
+│ indexer_prod  │      yes │            --- │          10 │
+│ test          │       no │    26m 58s ago │          10 │
+│ demo          │       no │      1 day ago │           5 │
+```
+
+### New features
+
+#### Account indexing
+
+A new event source `accounts` is available. Accounts can be used to index transactions and native transfers to and from an address. [Read more](/docs/accounts).
+
+#### `ponder:schema` alias
+
+The `ponder:schema` virtual module was added. It is an alias for `ponder.schema.ts`.
+
+```diff filename="src/index.ts"
+- import { accounts } from "../ponder.schema";
++ import { accounts } from "ponder:schema";
+```
+
+It also contains a default export of all the exported table objects from `ponder.schema.ts`.
+
+{/* prettier-ignore */}
+```ts filename="src/index.ts" {1,3}
+import schema from "ponder:schema";
+ 
+const row = await db.insert(schema.accounts).values({
+  address: "0x7Df1", balance: 0n
+});
+```
+
+### Breaking changes
+
+#### `@ponder/core` → `ponder`
+
+New versions will be published to `ponder` and not `@ponder/core`.
+
+{/* prettier-ignore */}
+<Tabs items={["pnpm", "yarn", "npm"]}>
+  <Tabs.Tab>
+```bash filename="shell"
+pnpm remove @ponder/core
+pnpm add ponder
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```bash filename="shell"
+yarn remove @ponder/core
+yarn add ponder
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```bash filename="shell"
+npm remove @ponder/core
+npm add ponder
+```
+</Tabs.Tab>
+</Tabs>
+
+#### `@/generated` → `ponder:registry`
+
+The virtual module `@/generated` was replaced with `ponder:registry`.
+
+```diff filename="src/index.ts"
+- import { ponder } from "@/generated";
++ import { ponder } from "ponder:registry";
+```
+
+#### `factory()` function
+
+The `factory()` function replaces the `factory` property in the contract config. The result should be passed to the `address` property.
+
+<div className="code-columns">
+
+```ts filename="ponder.config.ts (<=0.7)" {6-10}
+import { createConfig } from "@ponder/core";
+
+export default createConfig({
+  contracts: {
+    uniswap: {
+      factory: {
+        address: "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+        event: getAbiItem({ abi: UniswapV3FactoryAbi, name: "PoolCreated" }),
+        parameter: "pool",
+      },
+    },
+  },
+});
+```
+
+{/* prettier-ignore */}
+```ts filename="ponder.config.ts (0.8)" {6-10}
+import { createConfig, factory } from "ponder";
+
+export default createConfig({
+  contracts: {
+    uniswap: {
+      address: factory({
+        address: "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+        event: getAbiItem({ abi: UniswapV3FactoryAbi, name: "PoolCreated" }),
+        parameter: "pool",
+      }),
+    },
+  },
+});
+```
+
+</div>
+
+#### `ponder-env.d.ts`
+
+A new `ponder-env.d.ts` is required. The new file uses [triple slash directives](https://www.typescriptlang.org/docs/handbook/triple-slash-directives.html#-reference-types-) for (hopefully) less frequent updates.
+
+{/* prettier-ignore */}
+<Tabs items={["pnpm", "yarn", "npm"]}>
+  <Tabs.Tab>
+```bash filename="shell"
+pnpm codegen
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```bash filename="shell"
+yarn codegen
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```bash filename="shell"
+npm run codegen
+```
+</Tabs.Tab>
+</Tabs>
+
+#### Removed `transactionReceipt.logs`
+
+The `transactionReceipt.logs` property was removed from the `event` object.
+
+#### Removed redundant properties from `event`
+
+The following properties were removed from the `event` object.
+
+```diff
+- event.log.blockNumber;
+- event.log.blockHash;
+- event.log.transactionHash;
+- event.log.transactionIndex;
+- event.transaction.blockNumber;
+- event.transaction.blockHash;
+- event.transactionReceipt.transactionHash;
+- event.transactionReceipt.transactionIndex;
+```
+
+All of the data is still available on other properties of the `event` object, such as `event.transaction.hash` or `event.block.number`.
+
+## 0.7
+
+The `0.7` release includes several breaking changes.
+
+### Install & run codegen
+
+{/* prettier-ignore */}
+<Tabs items={["pnpm", "yarn", "npm"]}>
+  <Tabs.Tab>
+```bash filename="shell"
+pnpm add @ponder/core@0.7
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```bash filename="shell"
+yarn add @ponder/core@0.7
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```bash filename="shell"
+npm add @ponder/core@0.7
+```
+</Tabs.Tab>
+</Tabs>
+
+To ensure strong type safety during the migration, regenerate `ponder-env.d.ts`.
+
+{/* prettier-ignore */}
+<Tabs items={["pnpm", "yarn", "npm"]}>
+  <Tabs.Tab>
+```bash filename="shell"
+pnpm codegen
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```bash filename="shell"
+yarn codegen
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```bash filename="shell"
+npm run codegen
+```
+</Tabs.Tab>
+</Tabs>
+
+### Migrate `ponder.schema.ts`
+
+Here's a table defined with the new schema definition API, which uses [Drizzle](https://orm.drizzle.team/docs/overview) under the hood.
+
+```ts filename="ponder.schema.ts (after)"
+import { onchainTable } from "@ponder/core";
+
+export const accounts = onchainTable("account", (t) => ({
+  address: t.hex().primaryKey(),
+  daiBalance: t.bigint().notNull(),
+  isAdmin: t.boolean().notNull(),
+  graffiti: t.text(),
+}));
+```
+
+Key changes:
+
+1. Declare tables with the `onchainTable` function exported from `@ponder/core`
+2. Export all table objects from `ponder.schema.ts`
+3. Use `.primaryKey()` to mark the primary key column
+4. Columns are nullable by default, use `.notNull()` to add the constraint
+
+The new `onchainTable` function adds several new capabilities.
+
+- Custom primary key column name (other than `id`)
+- Composite primary keys
+- Default column values
+
+Here's a more advanced example with indexes and a composite primary key.
+
+```ts filename="ponder.schema.ts"
+import { onchainTable, index, primaryKey } from "@ponder/core";
+
+export const transferEvents = onchainTable(
+  "transfer_event",
+  (t) => ({
+    id: t.text().primaryKey(),
+    amount: t.bigint().notNull(),
+    timestamp: t.integer().notNull(),
+    from: t.hex().notNull(),
+    to: t.hex().notNull(),
+  }),
+  (table) => ({
+    fromIdx: index().on(table.from),
+  })
+);
+
+export const allowance = onchainTable(
+  "allowance",
+  (t) => ({
+    owner: t.hex().notNull(),
+    spender: t.hex().notNull(),
+    amount: t.bigint().notNull(),
+  }),
+  (table) => ({
+    pk: primaryKey({ columns: [table.owner, table.spender] }),
+  })
+);
+
+export const approvalEvent = onchainTable("approval_event", (t) => ({
+  id: t.text().primaryKey(),
+  amount: t.bigint().notNull(),
+  timestamp: t.integer().notNull(),
+  owner: t.hex().notNull(),
+  spender: t.hex().notNull(),
+}));
+```
+
+### Migrate indexing functions
+
+This release updates the indexing function database API to offer a unified SQL experience based on Drizzle.
+
+Here's an indexing function defined with the new API, which uses the table objects exported from `ponder.schema.ts`.
+
+{/* prettier-ignore */}
+```ts filename="src/index.ts"
+import { ponder } from "@/generated";
+import { account } from "../ponder.schema";
+
+ponder.on("ERC20:Transfer", async ({ event, context }) => {
+  await context.db
+    .insert(account)
+    .values({ 
+      address: event.args.from, 
+      balance: 0n, 
+      isOwner: false,
+    })
+    .onConflictDoUpdate((row) => ({
+      balance: row.balance - event.args.amount,
+    }));
+});
+```
+
+Key changes:
+
+1. Transition from ORM pattern `db.Account.create({ ... }){:ts}` to query builder pattern `db.insert(accounts, { ... }){:ts}`
+2. Import table objects from `ponder.schema.ts`
+3. Replace `findMany` with `db.sql.select(...)` or `db.sql.query(...)`
+
+Here is a simple migration example to familiarize yourself with the API.
+
+<div className="code-columns">
+
+```ts filename="src/index.ts (<=0.6)"
+// Create a single allowance
+await context.db.Allowance.create({
+  id: event.log.id,
+  data: {
+    owner: event.args.owner,
+    spender: event.args.spender,
+    amount: event.args.amount,
+  },
+});
+```
+
+{/* prettier-ignore */}
+```ts filename="src/index.ts (0.7)"
+import { allowance } from "../ponder.schema";
+
+// Create a single allowance
+await context.db
+  .insert(allowance)
+  .values({
+    id: event.log.id,
+    owner: event.args.owner,
+    spender: event.args.spender,
+    amount: event.args.amount,
+  });
+```
+
+</div>
+
+Here is a reference for how to migrate each method.
+
+```ts filename="src/index.ts"
+// create -> insert
+await context.db.Account.create({
+  id: event.args.from,
+  data: { balance: 0n },
+});
+await context.db.insert(account).values({ id: event.args.from, balance: 0n });
+
+// createMany -> insert
+await context.db.Account.createMany({
+  data: [
+    { id: event.args.from, balance: 0n },
+    { id: event.args.to, balance: 0n },
+  ],
+});
+await context.db.insert(account).values([
+  { id: event.args.from, balance: 0n },
+  { id: event.args.to, balance: 0n },
+]);
+
+// findUnique -> find
+await context.db.Account.findUnique({ id: event.args.from });
+await context.db.find(account, { address: event.args.from });
+
+// update
+await context.db.Account.update({
+  id: event.args.from,
+  data: ({ current }) => ({ balance: current.balance + 100n }),
+});
+await context.db
+  .update(account, { address: event.args.from })
+  .set((row) => ({ balance: row.balance + 100n }));
+
+// upsert
+await context.db.Account.upsert({
+  id: event.args.from,
+  create: { balance: 0n },
+  update: ({ current }) => ({ balance: current.balance + 100n }),
+});
+await context.db
+  .insert(account)
+  .values({ address: event.args.from, balance: 0n })
+  .onConflictDoUpdate((row) => ({ balance: row.balance + 100n }));
+
+// delete
+await context.db.Account.delete({ id: event.args.from });
+await context.db.delete(account, { address: event.args.from });
+
+// findMany -> select
+await context.db.Account.findMany({ where: { balance: { gt: 100n } } });
+await context.db.sql.select().from(account).where(eq(account.balance, 100n));
+```
+
+Finally, another migration example for an ERC20 Transfer indexing function using `upsert`.
+
+<div className="code-columns">
+
+{/* prettier-ignore */}
+```ts filename="src/index.ts"
+import { ponder } from "@/generated";
+
+ponder.on("ERC20:Transfer", async ({ event, context }) => {
+  const { Account, TransferEvent } = context.db;
+
+  await Account.upsert({
+    id: event.args.from,
+    create: {
+      balance: BigInt(0),
+      isOwner: false,
+    },
+    update: ({ current }) => ({
+      balance: current.balance - event.args.amount,
+    }),
+  });
+});
+```
+
+{/* prettier-ignore */}
+```ts filename="src/index.ts"
+import { ponder } from "@/generated";
+import { account } from "../ponder.schema";
+
+ponder.on("ERC20:Transfer", async ({ event, context }) => {
+  await context.db
+    .insert(account)
+    .values({
+      address: event.args.from,
+      balance: 0n, 
+      isOwner: false,
+    })
+    .onConflictDoUpdate((row) => ({
+      balance: row.balance - event.args.amount,
+    }));
+});
+```
+
+</div>
+
+#### Direct SQL API
+
+The `context.db.sql` interface replaces the rigid `findMany` method and supports any valid SQL `select` query.
+
+```ts filename="src/index.ts"
+import { desc } from "@ponder/core";
+import { account } from "../ponder.schema";
+
+ponder.on("...", ({ event, context }) => {
+  const result = await context.db.sql
+    .select()
+    .from(account)
+    .orderBy(desc(account.balance))
+    .limit(1);
+});
+```
+
+### Migrate API functions
+
+- Removed `c.tables` in favor of importing table objects from `ponder.schema.ts`
+
+## 0.6.0
+
+### Updated `viem` to `>=2`
+
+This release updates the `viem` peer dependency requirement to `>=2`. The `context.client` action `getBytecode` was renamed to `getCode`.
+
+{/* prettier-ignore */}
+<Tabs items={["pnpm", "yarn", "npm"]}>
+  <Tabs.Tab>
+```bash filename="shell"
+pnpm add viem@latest
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```bash filename="shell"
+yarn add viem@latest
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```bash filename="shell"
+npm install viem@latest
+```
+</Tabs.Tab>
+</Tabs>
+
+### Simplified Postgres schema pattern
+
+Starting with this release, the indexed tables, reorg tables, and metadata table for a Ponder app are contained in one Postgres schema, specified by the user in `ponder.config.ts` (defaults to `public`). This means the shared `ponder` schema is no longer used. (Note: The `ponder_sync` schema is still in use).
+
+This release also removes the view publishing pattern and the `publishSchema` option from `ponder.config.ts`, which may disrupt production setups using horizontal scaling or direct SQL. If you relied on the publish pattern, please [get in touch on Telegram](https://t.me/kevinkoste) and we'll work to get you unblocked.
+
+### Added `/ready`, updated `/health`
+
+The new `/ready` endpoint returns an HTTP `200` response once the app **is ready to serve requests**. This means that historical indexing is complete and the app is indexing events in realtime.
+
+The existing `/health` endpoint now returns an HTTP `200` response as soon as the process starts. (This release removes the `maxHealthcheckDuration` option, which previously governed the behavior of `/health`.)
+
+For Railway users, we now recommend using `/ready` as the health check endpoint to enable zero downtime deployments. If your app takes a while to sync, be sure to set the healthcheck timeout accordingly. Read the [Railway deployment guide](/docs/production/deploy#railway) for more details.
+
+### Metrics updates
+
+Please see the [changelog](https://github.com/ponder-sh/ponder/blob/main/packages/core/CHANGELOG.md#060) for specifics.
+
 ## 0.5.0
+
+### `hono` peer dependency
 
 **Breaking:** This release adds [Hono](https://hono.dev) as a peer dependency. After upgrading, install `hono` in your project.
 
@@ -54,6 +610,7 @@ Ponder now creates a table in the `public` schema for each table in `ponder.sche
 Isolation while running multiple Ponder instances against the same database also works differently. Before, Ponder used a schema with a pseudorandom name if the desired schema was in use. Now, Ponder will fail on startup with an error if it cannot acquire a lock on the desired schema.
 
 This also changes the zero-downtime behavior on platforms like Railway. For more information on how this works in `0.4`, please reference:
+
 - [Direct SQL](/docs/query/direct-sql)
 - [Zero-downtime deployments](/docs/production/zero-downtime)
 

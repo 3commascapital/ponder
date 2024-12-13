@@ -1,10 +1,12 @@
-import os from "node:os";
 import path from "node:path";
+import v8 from "node:v8";
 import type { CliOptions } from "@/bin/ponder.js";
 import type { LevelWithSilent } from "pino";
 
 export type Options = {
-  command: "dev" | "start" | "serve" | "codegen";
+  command: "dev" | "start" | "serve" | "codegen" | "list";
+
+  schema?: string;
 
   configFile: string;
   schemaFile: string;
@@ -17,7 +19,6 @@ export type Options = {
 
   port: number;
   hostname?: string;
-  maxHealthcheckDuration: number;
 
   telemetryUrl: string;
   telemetryDisabled: boolean;
@@ -29,14 +30,12 @@ export type Options = {
   databaseHeartbeatInterval: number;
   databaseHeartbeatTimeout: number;
   databaseMaxQueryParameters: number;
-  databaseMaxRowLimit: number;
 
   factoryAddressCountThreshold: number;
 
   indexingCacheMaxBytes: number;
   indexingCacheFlushRatio: number;
 
-  syncStoreMaxIntervals: number;
   syncEventsQuerySize: number;
   syncHandoffStaleSeconds: number;
 };
@@ -67,6 +66,8 @@ export const buildOptions = ({ cliOptions }: { cliOptions: CliOptions }) => {
     logLevel = "info";
   }
 
+  if (["list", "codegen"].includes(cliOptions.command)) logLevel = "error";
+
   const port =
     process.env.PORT !== undefined
       ? Number(process.env.PORT)
@@ -79,6 +80,8 @@ export const buildOptions = ({ cliOptions }: { cliOptions: CliOptions }) => {
   return {
     command: cliOptions.command,
 
+    schema: cliOptions.schema,
+
     rootDir,
     configFile: path.join(rootDir, cliOptions.config),
     schemaFile: path.join(rootDir, "ponder.schema.ts"),
@@ -90,7 +93,6 @@ export const buildOptions = ({ cliOptions }: { cliOptions: CliOptions }) => {
 
     port,
     hostname,
-    maxHealthcheckDuration: 240, // 4 minutes
 
     telemetryUrl: "https://ponder.sh/api/telemetry",
     telemetryDisabled: Boolean(process.env.PONDER_TELEMETRY_DISABLED),
@@ -101,24 +103,29 @@ export const buildOptions = ({ cliOptions }: { cliOptions: CliOptions }) => {
 
     databaseHeartbeatInterval: 10 * 1000,
     databaseHeartbeatTimeout: 25 * 1000,
-    // Half of the max query parameters for SQLite
+    // Half of the max query parameters for PGlite
     databaseMaxQueryParameters: 16_000,
-    databaseMaxRowLimit: 1_000,
 
     factoryAddressCountThreshold: 1_000,
 
-    // os.freemem() / 4, bucketed closest to 64, 128, 256, 512, 1024, 2048 mB
+    // v8.getHeapStatistics().heap_size_limit / 8, bucketed closest to 128, 256, 512, 1024, 2048 mB
     indexingCacheMaxBytes:
       2 **
         Math.min(
-          Math.max(Math.round(Math.log2(os.freemem() / 1_024 / 1_024 / 4)), 6),
+          Math.max(
+            Math.round(
+              Math.log2(
+                v8.getHeapStatistics().heap_size_limit / 1_024 / 1_024 / 8,
+              ),
+            ),
+            7,
+          ),
           11,
         ) *
       1_024 *
       1_024,
     indexingCacheFlushRatio: 0.35,
 
-    syncStoreMaxIntervals: 50_000,
     syncEventsQuerySize: 10_000,
     syncHandoffStaleSeconds: 300,
   } satisfies Options;

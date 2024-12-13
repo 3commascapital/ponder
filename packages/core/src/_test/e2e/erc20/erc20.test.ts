@@ -1,11 +1,11 @@
 import path from "node:path";
-import { ALICE, BOB } from "@/_test/constants.js";
+import { ALICE } from "@/_test/constants.js";
 import {
   setupAnvil,
   setupCommon,
   setupIsolatedDatabase,
 } from "@/_test/setup.js";
-import { simulate } from "@/_test/simulate.js";
+import { deployErc20, mintErc20 } from "@/_test/simulate.js";
 import {
   getFreePort,
   postGraphql,
@@ -13,9 +13,8 @@ import {
 } from "@/_test/utils.js";
 import { serve } from "@/bin/commands/serve.js";
 import { start } from "@/bin/commands/start.js";
-import { range } from "@/utils/range.js";
 import { rimrafSync } from "rimraf";
-import { zeroAddress } from "viem";
+import { parseEther, zeroAddress } from "viem";
 import { beforeEach, describe, expect, test } from "vitest";
 
 const rootDir = path.join(".", "src", "_test", "e2e", "erc20");
@@ -29,68 +28,72 @@ beforeEach(setupAnvil);
 beforeEach(setupIsolatedDatabase);
 
 const cliOptions = {
+  schema: "public",
   root: rootDir,
   config: "ponder.config.ts",
   logLevel: "error",
   logFormat: "pretty",
 };
 
-test("erc20", async (context) => {
-  const port = await getFreePort();
+test(
+  "erc20",
+  async () => {
+    const port = await getFreePort();
 
-  const cleanup = await start({
-    cliOptions: {
-      ...cliOptions,
-      command: "start",
+    const cleanup = await start({
+      cliOptions: {
+        ...cliOptions,
+        command: "start",
+        port,
+      },
+    });
+
+    const { address } = await deployErc20({ sender: ALICE });
+
+    await mintErc20({
+      erc20: address,
+      to: ALICE,
+      amount: parseEther("1"),
+      sender: ALICE,
+    });
+
+    await waitForIndexedBlock(port, "mainnet", 2);
+
+    const response = await postGraphql(
       port,
-    },
-  });
-
-  await simulate({
-    erc20Address: context.erc20.address,
-    factoryAddress: context.factory.address,
-  });
-
-  await waitForIndexedBlock(port, "mainnet", 8);
-
-  const response = await postGraphql(
-    port,
-    `
+      `
     accounts {
       items {
-        id
+        address
         balance
       }
     }
     `,
-  );
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as any;
 
-  expect(response.status).toBe(200);
-  const body = (await response.json()) as any;
-  expect(body.errors).toBe(undefined);
-  const accounts = body.data.accounts.items;
+    expect(body.errors).toBe(undefined);
+    const accounts = body.data.accounts.items;
+    expect(accounts[0]).toMatchObject({
+      address: zeroAddress,
+      balance: (-1 * 10 ** 18).toString(),
+    });
+    expect(accounts[1]).toMatchObject({
+      address: ALICE.toLowerCase(),
+      balance: (10 ** 18).toString(),
+    });
 
-  expect(accounts[0]).toMatchObject({
-    id: zeroAddress,
-    balance: (-2 * 10 ** 18).toString(),
-  });
-  expect(accounts[1]).toMatchObject({
-    id: BOB.toLowerCase(),
-    balance: (2 * 10 ** 18).toString(),
-  });
-  expect(accounts[2]).toMatchObject({
-    id: ALICE.toLowerCase(),
-    balance: "0",
-  });
+    await cleanup();
+  },
+  { timeout: 15_000 },
+);
 
-  await cleanup();
-});
-
-const shouldSkip = process.env.DATABASE_URL === undefined;
+const isPglite = !!process.env.DATABASE_URL;
 
 // Fix this once it's easier to have per-command kill functions in Ponder.ts.
-describe.skipIf(shouldSkip)("postgres database", () => {
-  test.todo("ponder serve", async (context) => {
+describe.skipIf(isPglite)("postgres database", () => {
+  test.todo("ponder serve", async () => {
     const startPort = await getFreePort();
 
     const cleanupStart = await start({
@@ -101,13 +104,14 @@ describe.skipIf(shouldSkip)("postgres database", () => {
       },
     });
 
-    for (const _ in range(0, 3)) {
-      await simulate({
-        erc20Address: context.erc20.address,
-        factoryAddress: context.factory.address,
-      });
-    }
+    const { address } = await deployErc20({ sender: ALICE });
 
+    await mintErc20({
+      erc20: address,
+      to: ALICE,
+      amount: parseEther("1"),
+      sender: ALICE,
+    });
     const servePort = await getFreePort();
 
     const cleanupServe = await serve({
@@ -123,7 +127,7 @@ describe.skipIf(shouldSkip)("postgres database", () => {
       `
       accounts {
         items {
-          id
+          address
           balance
         }
       }
@@ -137,16 +141,12 @@ describe.skipIf(shouldSkip)("postgres database", () => {
 
     expect(accounts).toHaveLength(3);
     expect(accounts[0]).toMatchObject({
-      id: zeroAddress,
-      balance: (-4 * 10 ** 18).toString(),
+      address: zeroAddress,
+      balance: (-1 * 10 ** 18).toString(),
     });
     expect(accounts[1]).toMatchObject({
-      id: BOB.toLowerCase(),
-      balance: (4 * 10 ** 18).toString(),
-    });
-    expect(accounts[2]).toMatchObject({
-      id: ALICE.toLowerCase(),
-      balance: "0",
+      address: ALICE.toLowerCase(),
+      balance: (10 ** 18).toString(),
     });
 
     await cleanupServe();

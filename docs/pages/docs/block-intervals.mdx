@@ -16,7 +16,7 @@ This guide describes how to configure block intervals, and suggests patterns for
 Every block interval must have a name, provided as a key to the `blocks` object. The name must be unique across `blocks` and `contracts`.
 
 ```ts filename="ponder.config.ts" {9}
-import { createConfig } from "@ponder/core";
+import { createConfig } from "ponder";
 import { http } from "viem";
 
 export default createConfig({
@@ -40,7 +40,8 @@ export default createConfig({
 This indexing function uses block events to index price chart data by reading the latest price from a Chainlink oracle contract every minute.
 
 ```ts filename="src/index.ts"
-import { ponder } from "@/generated";
+import { ponder } from "ponder:registry";
+import { prices } from "ponder:schema";
 import { ChainlinkOracleAbi } from "../abis/ChainlinkOracle.ts";
 
 ponder.on("ChainlinkOracleUpdate:block", async ({ event, context }) => {
@@ -51,14 +52,12 @@ ponder.on("ChainlinkOracleUpdate:block", async ({ event, context }) => {
     functionName: "latestAnswer",
   });
 
-  // Insert a Price record.
-  const token = await context.db.Price.create({
+  // Insert a row into the prices table.
+  await context.db.insert(prices).values({
     id: event.block.timestamp,
-    data: {
-      blockNumber: event.block.number,
-      timestamp: event.block.timestamp,
-      price: latestPrice,
-    },
+    blockNumber: event.block.number,
+    timestamp: event.block.timestamp,
+    price: latestPrice,
   });
 });
 ```
@@ -79,9 +78,9 @@ For example, if the network block time is 3 seconds and you want to run an index
 // 24 hours per day, 60 minutes per hour, 60 seconds per minute
 const secondsInterval = 24 * 60 * 60;
 // 3 seconds per block
-const blockTime = 3
+const blockTime = 3;
 // 28800 blocks per day
-const blockInterval = secondsInterval / blockTime
+const blockInterval = secondsInterval / blockTime;
 ```
 
 To find the block time of a specific chain, check the chain's documentation website or block explorer. Most Etherscan deployments have a [`/chart/blocktime`](https://polygonscan.com/chart/blocktime) page.
@@ -93,7 +92,7 @@ To find the block time of a specific chain, check the chain's documentation webs
 If you only need to index blocks from one network, pass the network name as a string to the `network` field.
 
 ```ts filename="ponder.config.ts" {10}
-import { createConfig } from "@ponder/core";
+import { createConfig } from "ponder";
 import { http } from "viem";
 
 export default createConfig({
@@ -115,7 +114,7 @@ export default createConfig({
 If you'd like to run the same block indexing function across multiple networks, pass an object to the `network` field containing network-specific options.
 
 ```ts filename="ponder.config.ts" {11-19}
-import { createConfig } from "@ponder/core";
+import { createConfig } from "ponder";
 import { http } from "viem";
 
 export default createConfig({
@@ -145,7 +144,7 @@ Now, the indexing functions you write for `ChainlinkOracleUpdate:block` will pro
 The `context.network` object contains information about which network the current block is from.
 
 ```ts filename="src/index.ts"
-import { ponder } from "@/generated";
+import { ponder } from "ponder:registry";
 
 ponder.on("ChainlinkOracleUpdate:block", async ({ event, context }) => {
   context.network;
@@ -166,7 +165,7 @@ The optional `startBlock` and `endBlock` options specify the block range to inde
 If `endBlock` is defined, no events will be indexed after that block number. This option is useful if you're only interested in a slice of historical data, or to enable faster feedback loops during development where it's not necessary to index the entire history.
 
 ```ts filename="ponder.config.ts" {9}
-import { createConfig } from "@ponder/core";
+import { createConfig } from "ponder";
 import { http } from "viem";
 
 export default createConfig({

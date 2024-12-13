@@ -16,7 +16,9 @@ export default {
     title: "Config",
   },
   "contracts-and-networks": "Contracts & networks",
+  "accounts": "Accounts",
   "block-intervals": "Block intervals",
+  "call-traces": "Call traces",
 
   "-- Schema": {
     type: "separator",
@@ -30,11 +32,11 @@ export default {
   },
   indexing: { display: "children", title: "Indexing" },
 
-  "-- Query": {
+  "-- Query the database": {
     type: "separator",
-    title: "Query",
+    title: "Query the database",
   },
-  query: { display: "children", title: "Query" },
+  query: { display: "children", title: "Query the database" },
 
   "-- Production": {
     type: "separator",
@@ -59,4 +61,19 @@ export default {
     title: "Advanced",
   },
   advanced: { display: "children", title: "Advanced" },
+
+  "-- Guides": {
+    type: "separator",
+    title: "Guides 🚧",
+  },
+  guides: { display: "children", title: "Guides" },
+
+  "-- Older versions": {
+    type: "separator",
+    title: "Older versions",
+  },
+  "0_6": { 
+    title: '0.1 – 0.6',
+    href: '/0_6/docs/getting-started/new-project'
+  },
 };

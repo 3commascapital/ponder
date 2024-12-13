@@ -4,9 +4,9 @@ import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { IndexingBuild } from "@/build/service.js";
+import type { PreBuild, SchemaBuild } from "@/build/index.js";
+import type { IndexingBuild } from "@/build/index.js";
 import type { Options } from "@/common/options.js";
-import { getTables } from "@/schema/utils.js";
 import { startClock } from "@/utils/timer.js";
 import { wait } from "@/utils/wait.js";
 import { createQueue } from "@ponder/common";
@@ -67,7 +67,11 @@ export function createTelemetry({
   logger,
 }: { options: Options; logger: Logger }) {
   if (options.telemetryDisabled) {
-    return { record: (_event: TelemetryEvent) => {}, kill: async () => {} };
+    return {
+      record: (_event: TelemetryEvent) => {},
+      flush: async () => {},
+      kill: async () => {},
+    };
   }
 
   const conf = new Conf<DeviceConf>({
@@ -118,12 +122,11 @@ export function createTelemetry({
 
     // Attempt to find and read the users package.json file.
     const packageJson = getPackageJson(options.rootDir);
-    const ponderCoreVersion =
-      packageJson?.dependencies?.["@ponder/core"] ?? "unknown";
+    const ponderVersion = packageJson?.dependencies?.ponder ?? "unknown";
     const viemVersion = packageJson?.dependencies?.viem ?? "unknown";
 
     // Make a guess as to whether the project is internal (within the monorepo) or not.
-    const isInternal = ponderCoreVersion === "workspace:*";
+    const isInternal = ponderVersion === "workspace:*";
 
     const cpus = os.cpus();
 
@@ -134,7 +137,7 @@ export function createTelemetry({
         is_internal: isInternal,
       } satisfies CommonProperties,
       session: {
-        ponder_core_version: ponderCoreVersion,
+        ponder_core_version: ponderVersion,
         viem_version: viemVersion,
         package_manager: packageManager,
         package_manager_version: packageManagerVersion,
@@ -208,6 +211,11 @@ export function createTelemetry({
     });
   }, HEARTBEAT_INTERVAL_MS);
 
+  // Note that this method is only used for testing.
+  const flush = async () => {
+    await queue.onIdle();
+  };
+
   const kill = async () => {
     clearInterval(heartbeatInterval);
     isKilled = true;
@@ -217,7 +225,7 @@ export function createTelemetry({
     await Promise.race([queue.onIdle(), wait(1_000)]);
   };
 
-  return { record, kill };
+  return { record, flush, kill };
 }
 
 async function getPackageManager() {
@@ -269,17 +277,27 @@ function getPackageJson(rootDir: string) {
   }
 }
 
-export function buildPayload(build: IndexingBuild) {
-  const table_count = Object.keys(getTables(build.schema)).length;
-  const indexing_function_count = Object.values(build.indexingFunctions).reduce(
-    (acc, f) => acc + Object.keys(f).length,
-    0,
-  );
+export function buildPayload({
+  preBuild,
+  schemaBuild,
+  indexingBuild,
+}: {
+  preBuild: PreBuild;
+  schemaBuild?: SchemaBuild;
+  indexingBuild?: IndexingBuild;
+}) {
+  const table_count = schemaBuild ? Object.keys(schemaBuild.schema).length : 0;
+  const indexing_function_count = indexingBuild
+    ? Object.values(indexingBuild.indexingFunctions).reduce(
+        (acc, f) => acc + Object.keys(f).length,
+        0,
+      )
+    : 0;
 
   return {
-    database_kind: build.databaseConfig.kind,
-    contract_count: build.sources.length,
-    network_count: build.networks.length,
+    database_kind: preBuild?.databaseConfig.kind,
+    contract_count: indexingBuild?.sources.length ?? 0,
+    network_count: indexingBuild?.networks.length ?? 0,
     table_count,
     indexing_function_count,
   };
